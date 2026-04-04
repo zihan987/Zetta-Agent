@@ -1,0 +1,8 @@
+target/
+
+.zetta/*
+!.zetta/project-permissions.json
+!.zetta/project-hooks.json
+
+hooks.jsonl
+.DS_Store
