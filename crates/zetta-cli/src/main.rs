@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Error, Result};
 use chrono::Utc;
@@ -23,7 +23,7 @@ use provider_config::{PersistentProviderProfile, ProviderConfigStore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-use zetta_core::engine::AgentEngine;
+use zetta_core::engine::{AgentEngine, EngineEventSink};
 use zetta_core::hook::{DenyToolHook, HookBus, JsonlHook, SessionAnnotatingHook};
 use zetta_core::model::{
     tool_call_from_user_input, ModelClient, ModelStreamSink, OpenAiCompatibleConfig,
@@ -107,6 +107,9 @@ struct Cli {
     #[arg(long, global = true)]
     stream_output: bool,
 
+    #[arg(long, global = true, value_enum, default_value = "pretty")]
+    ui_mode: CliUiMode,
+
     #[arg(long, global = true, default_value_t = 45)]
     request_timeout_seconds: u64,
 
@@ -149,6 +152,23 @@ impl CliPermissionMode {
 enum CliModelDriver {
     RuleBased,
     OpenaiCompatible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliUiMode {
+    Off,
+    Pretty,
+    Json,
+}
+
+impl CliUiMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pretty => "pretty",
+            Self::Json => "json",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -200,6 +220,11 @@ enum Commands {
 enum SessionCommands {
     #[command(about = "Print a saved session as JSON")]
     Show {
+        #[arg(long)]
+        session_id: SessionId,
+    },
+    #[command(about = "Print a compact session overview")]
+    Overview {
         #[arg(long)]
         session_id: SessionId,
     },
@@ -396,6 +421,9 @@ enum ReplCommand {
     ProviderClear,
     ModeShow,
     ModeSet(CliPermissionMode),
+    Overview,
+    UiShow,
+    UiSet(CliUiMode),
     EventsShow,
     EventsSet(bool),
     JsonShow,
@@ -439,6 +467,7 @@ async fn run_cli() -> Result<()> {
                 &workspace_root,
                 session_id,
                 cli.provider.as_deref(),
+                cli.ui_mode,
                 prompt,
             )
             .await?;
@@ -452,17 +481,20 @@ async fn run_cli() -> Result<()> {
                     println!("{}", serde_json::to_string(&event)?);
                 }
             } else {
-                let assistant = output
-                    .session
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| matches!(message.role, zetta_protocol::MessageRole::Assistant))
-                    .map(|message| message.content.as_str())
-                    .unwrap_or("<no assistant message>");
-
                 println!("session_id: {}", output.session.session_id);
-                println!("{assistant}");
+                if !cli.stream_output {
+                    let assistant = output
+                        .session
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| {
+                            matches!(message.role, zetta_protocol::MessageRole::Assistant)
+                        })
+                        .map(|message| message.content.as_str())
+                        .unwrap_or("<no assistant message>");
+                    println!("{assistant}");
+                }
             }
         }
         Commands::Repl { session_id } => {
@@ -486,6 +518,12 @@ async fn run_cli() -> Result<()> {
                     bail!("session `{session_id}` not found");
                 };
                 println!("{}", serde_json::to_string_pretty(&session)?);
+            }
+            SessionCommands::Overview { session_id } => {
+                let Some(session) = store.load(&session_id).await? else {
+                    bail!("session `{session_id}` not found");
+                };
+                print_session_overview(&session);
             }
         },
         Commands::Tool { command } => match command {
@@ -556,6 +594,7 @@ async fn run_agent_turn(
     workspace_root: &std::path::Path,
     session_id: Option<SessionId>,
     active_provider: Option<&str>,
+    ui_mode: CliUiMode,
     prompt: &str,
 ) -> Result<zetta_core::engine::RunTurnOutput> {
     let hook_bus = build_hook_bus(
@@ -580,13 +619,17 @@ async fn run_agent_turn(
         session_id,
         prompt: prompt.to_string(),
     };
+    let mut presenter =
+        StderrTurnPresenter::new(ui_mode, active_provider, cli.stream_output, prompt);
     if cli.stream_output {
         let mut sink = StderrModelStreamSink::default();
         engine
-            .run_turn_with_model_sink(request, Some(&mut sink))
+            .run_turn_with_sinks(request, Some(&mut sink), Some(&mut presenter))
             .await
     } else {
-        engine.run_turn(request).await
+        engine
+            .run_turn_with_sinks(request, None, Some(&mut presenter))
+            .await
     }
 }
 
@@ -605,8 +648,7 @@ async fn run_repl(
     let mut session_id = session_id.unwrap_or_default();
     let mut current_provider = cli.provider.clone();
     let mut current_permission_mode = cli.permission_mode;
-    let mut current_pretty_events = false;
-    let mut current_json_events = false;
+    let mut current_ui_mode = cli.ui_mode;
     let mut line = String::new();
 
     println!("Zetta REPL");
@@ -667,6 +709,9 @@ async fn run_repl(
                     println!("  :config   Show the current runtime summary");
                     println!("  :mode     Show the current permission mode");
                     println!("  :mode <read-only|workspace-write|bypass-permissions>");
+                    println!("  :overview Show a compact session overview");
+                    println!("  :ui       Show the current terminal UI mode");
+                    println!("  :ui <off|pretty|json>");
                     println!("  :events   Show pretty event tracing status");
                     println!("  :events on|off");
                     println!("  :json     Show JSON event output status");
@@ -773,6 +818,7 @@ async fn run_repl(
                         workspace_root,
                         Some(session_id),
                         current_provider.as_deref(),
+                        current_ui_mode,
                         &retry_prompt,
                     )
                     .await
@@ -786,15 +832,6 @@ async fn run_repl(
 
                     for failure in &output.hook_failures {
                         eprintln!("hook `{}` failed: {}", failure.handler_name, failure.error);
-                    }
-
-                    if current_json_events {
-                        for event in &output.events {
-                            println!("{}", serde_json::to_string(event)?);
-                        }
-                    }
-                    if current_pretty_events {
-                        print_engine_events_pretty(&output.events);
                     }
 
                     if !cli.stream_output {
@@ -841,6 +878,7 @@ async fn run_repl(
                         workspace_root,
                         Some(session_id),
                         current_provider.as_deref(),
+                        current_ui_mode,
                         &rerun_prompt,
                     )
                     .await
@@ -854,15 +892,6 @@ async fn run_repl(
 
                     for failure in &output.hook_failures {
                         eprintln!("hook `{}` failed: {}", failure.handler_name, failure.error);
-                    }
-
-                    if current_json_events {
-                        for event in &output.events {
-                            println!("{}", serde_json::to_string(event)?);
-                        }
-                    }
-                    if current_pretty_events {
-                        print_engine_events_pretty(&output.events);
                     }
 
                     if !cli.stream_output {
@@ -901,10 +930,13 @@ async fn run_repl(
                         session_id,
                         current_provider.as_deref(),
                         current_permission_mode,
-                        current_pretty_events,
-                        current_json_events,
+                        current_ui_mode,
                     )?;
                 }
+                ReplCommand::Overview => match store.load(&session_id).await? {
+                    Some(session) => print_session_overview(&session),
+                    None => println!("session_id: {session_id}\n<empty session>"),
+                },
                 ReplCommand::Load(target_session_id) => match store.load(&target_session_id).await?
                 {
                     Some(_) => {
@@ -959,21 +991,47 @@ async fn run_repl(
                     current_permission_mode = Some(mode);
                     println!("permission_mode: {}", mode.as_str());
                 }
+                ReplCommand::UiShow => {
+                    println!("ui: {}", current_ui_mode.as_str());
+                }
+                ReplCommand::UiSet(mode) => {
+                    current_ui_mode = mode;
+                    println!("ui: {}", current_ui_mode.as_str());
+                }
                 ReplCommand::EventsShow => {
                     println!(
                         "events: {}",
-                        if current_pretty_events { "on" } else { "off" }
+                        if current_ui_mode == CliUiMode::Pretty {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     );
                 }
                 ReplCommand::EventsSet(enabled) => {
-                    current_pretty_events = enabled;
+                    current_ui_mode = if enabled {
+                        CliUiMode::Pretty
+                    } else {
+                        CliUiMode::Off
+                    };
                     println!("events: {}", if enabled { "on" } else { "off" });
                 }
                 ReplCommand::JsonShow => {
-                    println!("json: {}", if current_json_events { "on" } else { "off" });
+                    println!(
+                        "json: {}",
+                        if current_ui_mode == CliUiMode::Json {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
                 }
                 ReplCommand::JsonSet(enabled) => {
-                    current_json_events = enabled;
+                    current_ui_mode = if enabled {
+                        CliUiMode::Json
+                    } else {
+                        CliUiMode::Off
+                    };
                     println!("json: {}", if enabled { "on" } else { "off" });
                 }
             }
@@ -992,6 +1050,7 @@ async fn run_repl(
             workspace_root,
             Some(session_id),
             current_provider.as_deref(),
+            current_ui_mode,
             input,
         )
         .await
@@ -1005,15 +1064,6 @@ async fn run_repl(
 
         for failure in &output.hook_failures {
             eprintln!("hook `{}` failed: {}", failure.handler_name, failure.error);
-        }
-
-        if current_json_events {
-            for event in &output.events {
-                println!("{}", serde_json::to_string(event)?);
-            }
-        }
-        if current_pretty_events {
-            print_engine_events_pretty(&output.events);
         }
 
         if !cli.stream_output {
@@ -1166,6 +1216,7 @@ fn parse_repl_command(input: &str) -> Option<Result<ReplCommand, String>> {
             )),
         },
         ":config" => Ok(ReplCommand::Config),
+        ":overview" => Ok(ReplCommand::Overview),
         ":fork" => Ok(ReplCommand::Fork),
         ":mode" => match parts.next() {
             None => Ok(ReplCommand::ModeShow),
@@ -1174,6 +1225,15 @@ fn parse_repl_command(input: &str) -> Option<Result<ReplCommand, String>> {
                     return Some(Err("expected `:mode <read-only|workspace-write|bypass-permissions>`".to_string()));
                 }
                 parse_repl_permission_mode(mode).map(ReplCommand::ModeSet)
+            }
+        },
+        ":ui" => match parts.next() {
+            None => Ok(ReplCommand::UiShow),
+            Some(mode) => {
+                if parts.next().is_some() {
+                    return Some(Err("expected `:ui <off|pretty|json>`".to_string()));
+                }
+                parse_repl_ui_mode(mode).map(ReplCommand::UiSet)
             }
         },
         ":events" => match parts.next() {
@@ -1228,6 +1288,17 @@ fn parse_repl_toggle(input: &str) -> Result<bool, String> {
         "on" => Ok(true),
         "off" => Ok(false),
         _ => Err(format!("invalid toggle `{input}`; expected `on` or `off`")),
+    }
+}
+
+fn parse_repl_ui_mode(input: &str) -> Result<CliUiMode, String> {
+    match input {
+        "off" => Ok(CliUiMode::Off),
+        "pretty" => Ok(CliUiMode::Pretty),
+        "json" => Ok(CliUiMode::Json),
+        _ => Err(format!(
+            "invalid ui mode `{input}`; expected `off`, `pretty`, or `json`"
+        )),
     }
 }
 
@@ -1428,8 +1499,7 @@ fn print_runtime_summary(
     session_id: SessionId,
     active_provider: Option<&str>,
     permission_mode_override: Option<CliPermissionMode>,
-    pretty_events_enabled: bool,
-    json_events_enabled: bool,
+    ui_mode: CliUiMode,
 ) -> Result<()> {
     let provider_config_store = ProviderConfigStore::new(&cli.config_dir);
     let provider_profile =
@@ -1453,11 +1523,23 @@ fn print_runtime_summary(
     println!("config_dir: {}", cli.config_dir.display());
     println!("session_dir: {}", cli.session_dir.display());
     println!("stream_output: {}", cli.stream_output);
+    println!("ui_mode: {}", ui_mode.as_str());
     println!(
         "events: {}",
-        if pretty_events_enabled { "on" } else { "off" }
+        if ui_mode == CliUiMode::Pretty {
+            "on"
+        } else {
+            "off"
+        }
     );
-    println!("json: {}", if json_events_enabled { "on" } else { "off" });
+    println!(
+        "json: {}",
+        if ui_mode == CliUiMode::Json {
+            "on"
+        } else {
+            "off"
+        }
+    );
     println!("provider: {}", active_provider.unwrap_or("<none>"));
     println!(
         "model_driver: {}",
@@ -1501,35 +1583,226 @@ fn print_runtime_summary(
     Ok(())
 }
 
-fn print_engine_events_pretty(events: &[zetta_protocol::EngineEvent]) {
-    for event in events {
+struct StderrTurnPresenter {
+    mode: CliUiMode,
+    active_provider: Option<String>,
+    stream_output: bool,
+    prompt_preview: String,
+    started_at: Instant,
+    requested_tools: usize,
+    completed_tools: usize,
+    denied_tools: usize,
+    failed_tools: usize,
+}
+
+impl StderrTurnPresenter {
+    fn new(
+        mode: CliUiMode,
+        active_provider: Option<&str>,
+        stream_output: bool,
+        prompt: &str,
+    ) -> Self {
+        Self {
+            mode,
+            active_provider: active_provider.map(ToString::to_string),
+            stream_output,
+            prompt_preview: summarize_history_content(prompt),
+            started_at: Instant::now(),
+            requested_tools: 0,
+            completed_tools: 0,
+            denied_tools: 0,
+            failed_tools: 0,
+        }
+    }
+
+    fn print_pretty_event(&mut self, event: &zetta_protocol::EngineEvent) {
         match event {
             zetta_protocol::EngineEvent::SessionLoaded { session_id, is_new } => {
-                println!("[event] session_loaded id={session_id} new={is_new}");
+                match self.active_provider.as_deref() {
+                    Some(provider) => eprintln!(
+                        "[turn] session={} state={} provider={} prompt=\"{}\"",
+                        session_id,
+                        if *is_new { "new" } else { "resume" },
+                        provider,
+                        self.prompt_preview
+                    ),
+                    None => eprintln!(
+                        "[turn] session={} state={} prompt=\"{}\"",
+                        session_id,
+                        if *is_new { "new" } else { "resume" },
+                        self.prompt_preview
+                    ),
+                }
             }
             zetta_protocol::EngineEvent::UserMessagePersisted { .. } => {
-                println!("[event] user_message_persisted");
+                eprintln!("[turn] user message persisted");
             }
             zetta_protocol::EngineEvent::ToolCallRequested { call } => {
-                println!("[event] tool_requested name={}", call.name);
+                self.requested_tools += 1;
+                eprintln!(
+                    "[tool] request {} {}",
+                    call.name,
+                    summarize_json_inline(&call.input, 88)
+                );
             }
             zetta_protocol::EngineEvent::ToolCallDenied { call, reason } => {
-                println!("[event] tool_denied name={} reason={reason}", call.name);
+                self.denied_tools += 1;
+                eprintln!("[tool] denied {}: {reason}", call.name);
             }
             zetta_protocol::EngineEvent::ToolCallFailed { call, error } => {
-                println!("[event] tool_failed name={} error={error}", call.name);
+                self.failed_tools += 1;
+                eprintln!("[tool] failed {}: {error}", call.name);
             }
             zetta_protocol::EngineEvent::ToolCallCompleted { result } => {
-                println!("[event] tool_completed name={}", result.name);
+                self.completed_tools += 1;
+                eprintln!(
+                    "[tool] done {} {}",
+                    result.name,
+                    summarize_json_inline(&result.output, 88)
+                );
             }
-            zetta_protocol::EngineEvent::AssistantMessagePersisted { .. } => {
-                println!("[event] assistant_message_persisted");
+            zetta_protocol::EngineEvent::AssistantMessagePersisted { message } => {
+                if !self.stream_output {
+                    eprintln!(
+                        "[assistant] {}",
+                        summarize_history_content(&message.content)
+                    );
+                } else {
+                    eprintln!("[assistant] response persisted");
+                }
             }
             zetta_protocol::EngineEvent::TurnFinished { session_id } => {
-                println!("[event] turn_finished id={session_id}");
+                eprintln!(
+                    "[summary] session={} tools={}/{}/{}/{} elapsed={}ms",
+                    session_id,
+                    self.requested_tools,
+                    self.completed_tools,
+                    self.denied_tools,
+                    self.failed_tools,
+                    self.started_at.elapsed().as_millis()
+                );
             }
         }
     }
+}
+
+impl EngineEventSink for StderrTurnPresenter {
+    fn on_event(&mut self, event: &zetta_protocol::EngineEvent) -> Result<()> {
+        match self.mode {
+            CliUiMode::Off => Ok(()),
+            CliUiMode::Pretty => {
+                self.print_pretty_event(event);
+                Ok(())
+            }
+            CliUiMode::Json => {
+                eprintln!("{}", serde_json::to_string(event)?);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn summarize_json_inline(value: &Value, max_len: usize) -> String {
+    let serialized = value.to_string();
+    let mut summary = serialized.chars().take(max_len).collect::<String>();
+    if serialized.chars().count() > max_len {
+        summary.push_str("...");
+    }
+    summary
+}
+
+#[derive(Default)]
+struct SessionOverview {
+    user_turns: usize,
+    assistant_messages: usize,
+    tool_messages: usize,
+    completed_tools: usize,
+    denied_tools: usize,
+    failed_tools: usize,
+    invalid_tool_calls: usize,
+    tool_usage: BTreeMap<String, usize>,
+}
+
+fn print_session_overview(session: &zetta_protocol::SessionSnapshot) {
+    let overview = build_session_overview(session);
+    println!("session_id: {}", session.session_id);
+    println!("updated_at: {}", session.updated_at.to_rfc3339());
+    println!("messages: {}", session.messages.len());
+    println!("user_turns: {}", overview.user_turns);
+    println!("assistant_messages: {}", overview.assistant_messages);
+    println!("tool_messages: {}", overview.tool_messages);
+    println!("tool_completed: {}", overview.completed_tools);
+    println!("tool_denied: {}", overview.denied_tools);
+    println!("tool_failed: {}", overview.failed_tools);
+    println!("tool_invalid: {}", overview.invalid_tool_calls);
+    if !overview.tool_usage.is_empty() {
+        println!(
+            "tool_usage: {}",
+            overview
+                .tool_usage
+                .iter()
+                .map(|(name, count)| format!("{name}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !session.tags.is_empty() {
+        println!("tags: {}", session.tags.join(", "));
+    }
+    if !session.metadata.is_empty() {
+        println!(
+            "metadata: {}",
+            session
+                .metadata
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn build_session_overview(session: &zetta_protocol::SessionSnapshot) -> SessionOverview {
+    let mut overview = SessionOverview::default();
+
+    for message in &session.messages {
+        match message.role {
+            zetta_protocol::MessageRole::User => overview.user_turns += 1,
+            zetta_protocol::MessageRole::Assistant => overview.assistant_messages += 1,
+            zetta_protocol::MessageRole::Tool => {
+                overview.tool_messages += 1;
+                if let Some((tool_name, status)) = parse_tool_message_metadata(&message.content) {
+                    *overview.tool_usage.entry(tool_name).or_insert(0) += 1;
+                    match status.as_str() {
+                        "completed" => overview.completed_tools += 1,
+                        "denied" => overview.denied_tools += 1,
+                        "failed" => overview.failed_tools += 1,
+                        "invalid_call" => overview.invalid_tool_calls += 1,
+                        _ => {}
+                    }
+                }
+            }
+            zetta_protocol::MessageRole::System => {}
+        }
+    }
+
+    overview
+}
+
+fn parse_tool_message_metadata(content: &str) -> Option<(String, String)> {
+    let value = serde_json::from_str::<Value>(content).ok()?;
+    let object = value.as_object()?;
+    if object.get("type")?.as_str()? != "tool_result" {
+        return None;
+    }
+    Some((
+        object.get("tool_name")?.as_str()?.to_string(),
+        object
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_string(),
+    ))
 }
 
 fn handle_permission_command(
@@ -1985,6 +2258,28 @@ fn build_default_workflow_guidance(tool_names: &std::collections::HashSet<&str>)
             "For local code changes, first inspect with `file_read_lines`, then modify with `file_edit_lines`."
                 .to_string(),
         );
+        guidance.push(
+            "If the user explicitly asked for an edit, do not stop after inspection; make the edit once you have enough context."
+                .to_string(),
+        );
+    }
+
+    if tool_names.contains("glob") {
+        guidance.push(
+            "For repository structure, file lists, or extension-based discovery, prefer `glob` instead of `bash`."
+                .to_string(),
+        );
+        guidance.push(
+            "Keep `glob` patterns focused and set `max_results` when listing broad directories to avoid oversized outputs."
+                .to_string(),
+        );
+    }
+
+    if tool_names.contains("grep") {
+        guidance.push(
+            "For code or text search, prefer `grep` instead of shell `find`/`grep` pipelines."
+                .to_string(),
+        );
     }
 
     if tool_names.contains("grep") || tool_names.contains("glob") {
@@ -1996,7 +2291,15 @@ fn build_default_workflow_guidance(tool_names: &std::collections::HashSet<&str>)
 
     if tool_names.contains("bash") {
         guidance.push(
-            "Use `bash` for verification commands only when file tools are insufficient or when you need to run project commands. Keep `bash` calls to a single non-destructive command without shell chaining or redirection."
+            "Use `bash` for verification commands only when file tools are insufficient or when you need to run project commands."
+                .to_string(),
+        );
+        guidance.push(
+            "Keep `bash` calls to a single non-destructive command. Do not use shell pipelines, chaining, redirection, or `find ... | head` style constructs."
+                .to_string(),
+        );
+        guidance.push(
+            "If a `bash` call is denied, immediately rewrite the plan using `glob`, `grep`, `file_read`, or `file_read_lines` instead of retrying the same shell pattern."
                 .to_string(),
         );
     }
@@ -2025,11 +2328,22 @@ fn build_default_tool_examples(tool_names: &std::collections::HashSet<&str>) -> 
                 .to_string(),
         );
     }
+    if tool_names.contains("glob") {
+        examples.push(
+            r#"- List Rust files: /tool glob {"pattern":"crates/**/*.rs","max_results":40}"#
+                .to_string(),
+        );
+    }
     if tool_names.contains("grep") {
-        examples.push(r#"- Search by content: /tool grep {"pattern":"MyFunction"}"#.to_string());
+        examples.push(
+            r#"- Search by content: /tool grep {"pattern":"MyFunction","max_results":20}"#
+                .to_string(),
+        );
     }
     if tool_names.contains("bash") {
-        examples.push(r#"- Run a command: /tool bash {"command":"cargo test"}"#.to_string());
+        examples.push(
+            r#"- Run one verification command: /tool bash {"command":"cargo test"}"#.to_string(),
+        );
     }
 
     if examples.is_empty() {
@@ -2237,11 +2551,11 @@ mod tests {
     use zetta_protocol::SessionId;
 
     use crate::provider_config::PersistentProviderProfile;
-    use crate::CliPermissionMode;
+    use crate::{CliPermissionMode, CliUiMode};
 
     use super::{
-        default_openai_system_prompt, latest_assistant_message, parse_repl_command,
-        render_cli_error_lines, render_repl_prompt, resolve_openai_options,
+        build_session_overview, default_openai_system_prompt, latest_assistant_message,
+        parse_repl_command, render_cli_error_lines, render_repl_prompt, resolve_openai_options,
         search_session_messages, summarize_history_content, trim_session_to_last_user_turns,
         user_turn_from_end, ReplCommand, ResolvedOpenAiCompatibleOptions,
     };
@@ -2249,6 +2563,16 @@ mod tests {
     #[test]
     fn default_system_prompt_lists_visible_tools() {
         let prompt = default_openai_system_prompt(&[
+            ToolDefinition {
+                name: "glob".to_string(),
+                description: "Matches files by wildcard.".to_string(),
+                capability: ToolCapability::Read,
+            },
+            ToolDefinition {
+                name: "grep".to_string(),
+                description: "Searches file contents.".to_string(),
+                capability: ToolCapability::Read,
+            },
             ToolDefinition {
                 name: "file_read_lines".to_string(),
                 description: "Reads an inclusive line range.".to_string(),
@@ -2259,6 +2583,11 @@ mod tests {
                 description: "Replaces an inclusive line range.".to_string(),
                 capability: ToolCapability::Write,
             },
+            ToolDefinition {
+                name: "bash".to_string(),
+                description: "Runs one shell command.".to_string(),
+                capability: ToolCapability::Execute,
+            },
         ]);
 
         assert!(prompt.contains("file_read_lines"));
@@ -2266,6 +2595,10 @@ mod tests {
         assert!(prompt.contains("respond with exactly one line"));
         assert!(prompt
             .contains("first inspect with `file_read_lines`, then modify with `file_edit_lines`"));
+        assert!(prompt.contains("prefer `glob` instead of `bash`"));
+        assert!(prompt.contains("prefer `grep` instead of shell `find`/`grep` pipelines"));
+        assert!(prompt.contains("Do not use shell pipelines"));
+        assert!(prompt.contains("List Rust files"));
         assert!(prompt.contains("Read a focused range"));
     }
 
@@ -2382,8 +2715,20 @@ mod tests {
             Some(Ok(ReplCommand::Config))
         ));
         assert!(matches!(
+            parse_repl_command(":overview"),
+            Some(Ok(ReplCommand::Overview))
+        ));
+        assert!(matches!(
             parse_repl_command(":fork"),
             Some(Ok(ReplCommand::Fork))
+        ));
+        assert!(matches!(
+            parse_repl_command(":ui"),
+            Some(Ok(ReplCommand::UiShow))
+        ));
+        assert!(matches!(
+            parse_repl_command(":ui pretty"),
+            Some(Ok(ReplCommand::UiSet(CliUiMode::Pretty)))
         ));
         assert!(matches!(
             parse_repl_command(":mode"),
@@ -2447,6 +2792,7 @@ mod tests {
         let provider_missing = parse_repl_command(":provider use").expect("command");
         let provider_unknown = parse_repl_command(":provider nope").expect("command");
         let mode_invalid = parse_repl_command(":mode invalid-mode").expect("command");
+        let ui_invalid = parse_repl_command(":ui invalid").expect("command");
         let events_invalid = parse_repl_command(":events maybe").expect("command");
         let json_invalid = parse_repl_command(":json maybe").expect("command");
 
@@ -2455,6 +2801,7 @@ mod tests {
             matches!(provider_unknown, Err(error) if error.contains("unknown provider subcommand"))
         );
         assert!(matches!(mode_invalid, Err(error) if error.contains("invalid mode")));
+        assert!(matches!(ui_invalid, Err(error) if error.contains("invalid ui mode")));
         assert!(matches!(events_invalid, Err(error) if error.contains("invalid toggle")));
         assert!(matches!(json_invalid, Err(error) if error.contains("invalid toggle")));
     }
@@ -2591,6 +2938,48 @@ mod tests {
         );
 
         assert_eq!(prompt, "zetta[11111111 ro deepseek]> ");
+    }
+
+    #[test]
+    fn session_overview_counts_tool_statuses() {
+        let mut session = zetta_protocol::SessionSnapshot::new(SessionId::new());
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::User,
+            "inspect auth",
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::Tool,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "tool_result",
+                "tool_name": "grep",
+                "status": "completed",
+                "output": { "matches": 2 }
+            }))
+            .expect("tool result"),
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::Tool,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "tool_result",
+                "tool_name": "bash",
+                "status": "failed",
+                "error": "spawn error"
+            }))
+            .expect("tool result"),
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::Assistant,
+            "done",
+        ));
+
+        let overview = build_session_overview(&session);
+        assert_eq!(overview.user_turns, 1);
+        assert_eq!(overview.assistant_messages, 1);
+        assert_eq!(overview.tool_messages, 2);
+        assert_eq!(overview.completed_tools, 1);
+        assert_eq!(overview.failed_tools, 1);
+        assert_eq!(overview.tool_usage.get("grep"), Some(&1));
+        assert_eq!(overview.tool_usage.get("bash"), Some(&1));
     }
 
     #[test]

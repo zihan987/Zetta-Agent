@@ -1,6 +1,6 @@
 # Zetta 使用指南
 
-这是当前 `v0.2.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
+这是当前 `v0.3.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
 
 ## 它现在是什么
 
@@ -14,6 +14,7 @@ Zetta 目前是一个以 CLI 和 REPL 为主的 agent runtime。
 - 执行受限的 `bash` 命令
 - 持久化 session
 - 应用 permission 和 hook 策略
+- 通过 `--ui-mode` 在 stderr 上显示实时 turn 进度
 
 它目前还不是一个全屏 terminal UI。
 
@@ -32,6 +33,7 @@ cargo test
 
 ```bash
 cargo run -p zetta-cli -- run --prompt "hello"
+cargo run -p zetta-cli -- --ui-mode pretty run --prompt "检查当前工作区"
 ```
 
 启动交互式 REPL：
@@ -60,6 +62,9 @@ REPL 内置本地命令：
 - `:provider use <name>`
 - `:provider clear`
 - `:config`
+- `:overview`
+- `:ui`
+- `:ui <off|pretty|json>`
 - `:mode`
 - `:mode <read-only|workspace-write|bypass-permissions>`
 - `:events`
@@ -70,6 +75,12 @@ REPL 内置本地命令：
 - `:fork`
 - `:exit`
 - `:quit`
+
+快速查看某个 session 的概览：
+
+```bash
+cargo run -p zetta-cli -- session overview --session-id <uuid>
+```
 
 创建并使用 provider profile：
 

@@ -237,7 +237,8 @@ impl PermissionPolicy {
 
     #[must_use]
     pub fn should_skip_walk_entry_for_read(&self, path: &Path) -> bool {
-        self.mode != PermissionMode::BypassPermissions && sensitive_read_reason(path).is_some()
+        self.mode != PermissionMode::BypassPermissions
+            && (sensitive_read_reason(path).is_some() || noisy_walk_reason(path).is_some())
     }
 
     pub fn check_shell_command(&self, command: &str) -> Result<(), ToolInvocationError> {
@@ -359,6 +360,14 @@ fn sensitive_read_reason(path: &Path) -> Option<&'static str> {
     None
 }
 
+fn noisy_walk_reason(path: &Path) -> Option<&'static str> {
+    if contains_noisy_walk_dir_component(path) {
+        return Some("generated or runtime directories are skipped during recursive search");
+    }
+
+    None
+}
+
 fn sensitive_write_reason(path: &Path) -> Option<&'static str> {
     if contains_protected_write_dir_component(path) {
         return Some("protected runtime or repository metadata cannot be modified by file tools");
@@ -398,6 +407,23 @@ fn contains_protected_write_dir_component(path: &Path) -> bool {
     })
 }
 
+fn contains_noisy_walk_dir_component(path: &Path) -> bool {
+    let mut saw_zetta = false;
+
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            match name.to_str() {
+                Some("target") => return true,
+                Some(".zetta") => saw_zetta = true,
+                Some("sessions") if saw_zetta => return true,
+                _ => saw_zetta = false,
+            }
+        }
+    }
+
+    false
+}
+
 fn is_sensitive_secret_file(file_name: &str) -> bool {
     matches!(
         file_name,
@@ -411,22 +437,49 @@ fn is_sensitive_secret_file(file_name: &str) -> bool {
 
 fn detect_disallowed_shell_construct(command: &str) -> Option<String> {
     let forbidden = [
-        ("&&", "command chaining with `&&` is not allowed"),
-        ("||", "command chaining with `||` is not allowed"),
+        (
+            "&&",
+            "command chaining with `&&` is not allowed; run one command at a time",
+        ),
+        (
+            "||",
+            "command chaining with `||` is not allowed; run one command at a time",
+        ),
         (
             ";",
-            "multiple shell commands separated by `;` are not allowed",
+            "multiple shell commands separated by `;` are not allowed; run one command at a time",
         ),
         ("\n", "multi-line shell commands are not allowed"),
         ("$(", "subshell command substitution is not allowed"),
         ("`", "backtick command substitution is not allowed"),
-        (" | ", "shell pipelines are not allowed"),
-        ("|&", "shell pipelines are not allowed"),
-        (" >", "shell redirection is not allowed"),
-        (" >>", "shell redirection is not allowed"),
-        (" 2>", "shell redirection is not allowed"),
-        (" 1>", "shell redirection is not allowed"),
-        (" < ", "input redirection is not allowed"),
+        (
+            " | ",
+            "shell pipelines are not allowed; use `glob` for file discovery, `grep` for content search, or run a single command without `|`",
+        ),
+        (
+            "|&",
+            "shell pipelines are not allowed; use `glob` for file discovery, `grep` for content search, or run a single command without `|`",
+        ),
+        (
+            " >",
+            "shell redirection is not allowed; inspect command output directly and use file tools for edits",
+        ),
+        (
+            " >>",
+            "shell redirection is not allowed; inspect command output directly and use file tools for edits",
+        ),
+        (
+            " 2>",
+            "shell redirection is not allowed; inspect command output directly and use file tools for edits",
+        ),
+        (
+            " 1>",
+            "shell redirection is not allowed; inspect command output directly and use file tools for edits",
+        ),
+        (
+            " < ",
+            "input redirection is not allowed; run a single command with explicit arguments instead",
+        ),
     ];
 
     forbidden

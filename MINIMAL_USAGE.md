@@ -1,6 +1,6 @@
 # Zetta Minimal Usage
 
-This is the shortest practical guide for using the current `v0.2.0` Zetta CLI and REPL.
+This is the shortest practical guide for using the current `v0.3.0` Zetta CLI and REPL.
 
 ## What It Is
 
@@ -14,6 +14,7 @@ It can:
 - execute a limited `bash` subset
 - persist sessions
 - enforce permission and hook policy
+- show live turn progress on stderr with `--ui-mode`
 
 It is not yet a full-screen terminal UI.
 
@@ -32,6 +33,7 @@ Use the default local placeholder model:
 
 ```bash
 cargo run -p zetta-cli -- run --prompt "hello"
+cargo run -p zetta-cli -- --ui-mode pretty run --prompt "inspect the workspace"
 ```
 
 Start an interactive REPL:
@@ -60,6 +62,9 @@ Local REPL commands:
 - `:provider use <name>`
 - `:provider clear`
 - `:config`
+- `:overview`
+- `:ui`
+- `:ui <off|pretty|json>`
 - `:mode`
 - `:mode <read-only|workspace-write|bypass-permissions>`
 - `:events`
@@ -70,6 +75,12 @@ Local REPL commands:
 - `:fork`
 - `:exit`
 - `:quit`
+
+Inspect a saved session quickly:
+
+```bash
+cargo run -p zetta-cli -- session overview --session-id <uuid>
+```
 
 Create and use a provider profile:
 

@@ -682,7 +682,8 @@ fn tool_parameters_schema(tool_name: &str) -> Value {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Wildcard pattern using * and ?." },
-                "root": { "type": "string", "description": "Optional root path to search from." }
+                "root": { "type": "string", "description": "Optional root path to search from." },
+                "max_results": { "type": "integer", "description": "Maximum number of matching paths to return." }
             },
             "required": ["pattern"],
             "additionalProperties": false,

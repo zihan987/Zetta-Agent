@@ -15,7 +15,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &'static str {
-        "Runs a shell command with zsh -lc in the current working directory."
+        "Runs one verification-oriented shell command with zsh -lc in the current working directory. Pipelines, chaining, and redirection are not allowed."
     }
 
     fn capability(&self) -> ToolCapability {

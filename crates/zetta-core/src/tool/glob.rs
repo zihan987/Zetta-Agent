@@ -15,7 +15,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &'static str {
-        "Recursively matches files under a root using simple * and ? wildcards."
+        "Recursively matches files under a root using simple * and ? wildcards. Prefer this for repository structure and file discovery."
     }
 
     fn capability(&self) -> ToolCapability {
@@ -34,17 +34,23 @@ impl Tool for GlobTool {
                 ToolInvocationError::Failed(anyhow!("glob requires a string `pattern`"))
             })?;
         let raw_root = input.get("root").and_then(Value::as_str).unwrap_or(".");
+        let max_results = input
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(100) as usize;
 
         let root = context
             .permissions()
             .resolve_read_path(context.cwd(), raw_root)?;
         let mut matches = Vec::new();
-        collect_matching_paths(context, &root, &root, pattern, &mut matches)
+        collect_matching_paths(context, &root, &root, pattern, max_results, &mut matches)
             .map_err(ToolInvocationError::Failed)?;
 
         Ok(json!({
             "pattern": pattern,
             "root": root,
+            "max_results": max_results,
+            "truncated": matches.len() >= max_results,
             "matches": matches,
         }))
     }
@@ -55,9 +61,14 @@ fn collect_matching_paths(
     walk_root: &Path,
     current: &Path,
     pattern: &str,
+    max_results: usize,
     matches: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(current)? {
+        if matches.len() >= max_results {
+            break;
+        }
+
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
@@ -67,7 +78,7 @@ fn collect_matching_paths(
         }
 
         if file_type.is_dir() {
-            collect_matching_paths(context, walk_root, &path, pattern, matches)?;
+            collect_matching_paths(context, walk_root, &path, pattern, max_results, matches)?;
             continue;
         }
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.0
+
+P3 terminal UX release.
+
+Included in this release:
+
+- live engine event streaming from the core runtime into the CLI
+- `--ui-mode off|pretty|json` for stderr turn presentation
+- compact pretty turn summaries with tool progress and elapsed time
+- session overview helpers in both `session overview` and REPL `:overview`
+- REPL UI mode controls via `:ui`, while keeping `:events` and `:json` as compatibility aliases
+
+This release keeps the headless + REPL shape from `v0.2.0`, but makes the terminal experience feel more like a product instead of a raw event dump.
+
 ## v0.2.0
 
 P2 model/provider depth release.

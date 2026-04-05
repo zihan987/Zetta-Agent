@@ -14,6 +14,10 @@ use crate::tool::{ToolInvocationError, ToolRegistry, ToolUseContext};
 
 const MAX_MODEL_STEPS: usize = 8;
 
+pub trait EngineEventSink {
+    fn on_event(&mut self, event: &EngineEvent) -> Result<()>;
+}
+
 pub struct AgentEngine {
     model: Arc<dyn ModelClient>,
     sessions: Arc<dyn SessionStore>,
@@ -47,7 +51,7 @@ impl AgentEngine {
     }
 
     pub async fn run_turn(&self, request: TurnRequest) -> Result<RunTurnOutput> {
-        self.run_turn_with_model_sink(request, None).await
+        self.run_turn_with_sinks(request, None, None).await
     }
 
     pub async fn run_turn_with_model_sink(
@@ -55,13 +59,28 @@ impl AgentEngine {
         request: TurnRequest,
         mut model_sink: Option<&mut dyn ModelStreamSink>,
     ) -> Result<RunTurnOutput> {
+        self.run_turn_with_sinks(request, model_sink.take(), None)
+            .await
+    }
+
+    pub async fn run_turn_with_sinks(
+        &self,
+        request: TurnRequest,
+        mut model_sink: Option<&mut dyn ModelStreamSink>,
+        mut event_sink: Option<&mut dyn EngineEventSink>,
+    ) -> Result<RunTurnOutput> {
         let mut hook_failures = Vec::new();
         let session_id = request.session_id.unwrap_or_default();
         let loaded = self.sessions.load(&session_id).await?;
         let is_new = loaded.is_none();
         let mut session = loaded.unwrap_or_else(|| SessionSnapshot::new(session_id));
 
-        let mut events = vec![EngineEvent::SessionLoaded { session_id, is_new }];
+        let mut events = Vec::new();
+        self.push_event(
+            &mut events,
+            EngineEvent::SessionLoaded { session_id, is_new },
+            &mut event_sink,
+        )?;
         self.apply_hook_dispatch(
             &mut session,
             self.hooks
@@ -73,9 +92,13 @@ impl AgentEngine {
         let user_message = Message::new(MessageRole::User, request.prompt);
         session.messages.push(user_message.clone());
         session.updated_at = Utc::now();
-        events.push(EngineEvent::UserMessagePersisted {
-            message: user_message,
-        });
+        self.push_event(
+            &mut events,
+            EngineEvent::UserMessagePersisted {
+                message: user_message,
+            },
+            &mut event_sink,
+        )?;
         let mut completed = false;
         for _ in 0..MAX_MODEL_STEPS {
             let message_count = session.messages.len();
@@ -114,9 +137,13 @@ impl AgentEngine {
                     );
                     let assistant_message = Message::new(MessageRole::Assistant, content);
                     session.messages.push(assistant_message.clone());
-                    events.push(EngineEvent::AssistantMessagePersisted {
-                        message: assistant_message,
-                    });
+                    self.push_event(
+                        &mut events,
+                        EngineEvent::AssistantMessagePersisted {
+                            message: assistant_message,
+                        },
+                        &mut event_sink,
+                    )?;
                     completed = true;
                     break;
                 }
@@ -133,7 +160,11 @@ impl AgentEngine {
                             .await,
                         &mut hook_failures,
                     );
-                    events.push(EngineEvent::ToolCallRequested { call: call.clone() });
+                    self.push_event(
+                        &mut events,
+                        EngineEvent::ToolCallRequested { call: call.clone() },
+                        &mut event_sink,
+                    )?;
                     let before_tool_dispatch = self
                         .hooks
                         .emit(HookEvent::BeforeToolCall {
@@ -152,10 +183,14 @@ impl AgentEngine {
                             encode_tool_denied_message(&tool_name, &reason)?,
                         );
                         session.messages.push(tool_message);
-                        events.push(EngineEvent::ToolCallDenied {
-                            call,
-                            reason: reason.clone(),
-                        });
+                        self.push_event(
+                            &mut events,
+                            EngineEvent::ToolCallDenied {
+                                call,
+                                reason: reason.clone(),
+                            },
+                            &mut event_sink,
+                        )?;
                         self.apply_hook_dispatch(
                             &mut session,
                             self.hooks
@@ -182,9 +217,13 @@ impl AgentEngine {
                                 encode_tool_result_message(&result.name, &result.output)?,
                             );
                             session.messages.push(tool_message);
-                            events.push(EngineEvent::ToolCallCompleted {
-                                result: result.clone(),
-                            });
+                            self.push_event(
+                                &mut events,
+                                EngineEvent::ToolCallCompleted {
+                                    result: result.clone(),
+                                },
+                                &mut event_sink,
+                            )?;
                             self.apply_hook_dispatch(
                                 &mut session,
                                 self.hooks
@@ -203,7 +242,11 @@ impl AgentEngine {
                                 encode_tool_denied_message(&tool_name, &reason)?,
                             );
                             session.messages.push(tool_message);
-                            events.push(EngineEvent::ToolCallDenied { call, reason });
+                            self.push_event(
+                                &mut events,
+                                EngineEvent::ToolCallDenied { call, reason },
+                                &mut event_sink,
+                            )?;
                             self.apply_hook_dispatch(
                                 &mut session,
                                 self.hooks
@@ -224,10 +267,14 @@ impl AgentEngine {
                                 encode_tool_failed_message(&tool_name, &error_text)?,
                             );
                             session.messages.push(tool_message);
-                            events.push(EngineEvent::ToolCallFailed {
-                                call,
-                                error: error_text.clone(),
-                            });
+                            self.push_event(
+                                &mut events,
+                                EngineEvent::ToolCallFailed {
+                                    call,
+                                    error: error_text.clone(),
+                                },
+                                &mut event_sink,
+                            )?;
                             self.apply_hook_dispatch(
                                 &mut session,
                                 self.hooks
@@ -271,9 +318,13 @@ impl AgentEngine {
                 format!("Stopped after reaching the max planning steps ({MAX_MODEL_STEPS})."),
             );
             session.messages.push(assistant_message.clone());
-            events.push(EngineEvent::AssistantMessagePersisted {
-                message: assistant_message,
-            });
+            self.push_event(
+                &mut events,
+                EngineEvent::AssistantMessagePersisted {
+                    message: assistant_message,
+                },
+                &mut event_sink,
+            )?;
         }
 
         session.updated_at = Utc::now();
@@ -300,13 +351,30 @@ impl AgentEngine {
                 .await,
             &mut hook_failures,
         );
-        events.push(EngineEvent::TurnFinished { session_id });
+        self.push_event(
+            &mut events,
+            EngineEvent::TurnFinished { session_id },
+            &mut event_sink,
+        )?;
 
         Ok(RunTurnOutput {
             events,
             session,
             hook_failures,
         })
+    }
+
+    fn push_event(
+        &self,
+        events: &mut Vec<EngineEvent>,
+        event: EngineEvent,
+        event_sink: &mut Option<&mut dyn EngineEventSink>,
+    ) -> Result<()> {
+        if let Some(sink) = event_sink.as_deref_mut() {
+            sink.on_event(&event)?;
+        }
+        events.push(event);
+        Ok(())
     }
 
     fn apply_hook_dispatch(

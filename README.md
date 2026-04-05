@@ -11,12 +11,13 @@ Docs:
 
 ## Release Status
 
-Current release target: `v0.2.0`
+Current release target: `v0.3.0`
 
 - `P0` complete: runtime core, permissions, hooks, sessions, OpenAI-compatible model driver
 - `P1` complete: interactive REPL and CLI ergonomics
 - `P2` complete: native tool-calling for OpenAI-compatible providers with text fallback preserved
-- Next focus: `P3` product UX and integrations
+- `P3` complete: terminal UX, live turn presentation, and session overview helpers
+- Next focus: `P4` integrations and external surfaces
 
 ## Current Scope
 
@@ -37,6 +38,8 @@ The current workspace ships a usable CLI agent runtime:
 - optional `openai-compatible` model driver for real remote completions
 - native tool-calling for OpenAI-compatible providers, with the existing `/tool ...` path kept as a fallback
 - invalid `/tool ...` attempts are fed back into the transcript so the model can correct and retry within the same turn
+- a live stderr turn presenter with `--ui-mode off|pretty|json`
+- session overview helpers in both `session overview` and REPL
 
 This intentionally does **not** include:
 
@@ -82,6 +85,9 @@ Local REPL commands:
 - `:config`
 - `:mode`
 - `:mode <read-only|workspace-write|bypass-permissions>`
+- `:overview`
+- `:ui`
+- `:ui <off|pretty|json>`
 - `:events`
 - `:events on|off`
 - `:json`
@@ -98,6 +104,7 @@ cd Zetta-Agent
 cargo run -p zetta-cli -- run --prompt "hello"
 cargo run -p zetta-cli -- repl
 cargo run -p zetta-cli -- run --prompt "/tool echo staged rewrite"
+cargo run -p zetta-cli -- --ui-mode pretty run --prompt "inspect the workspace"
 cargo run -p zetta-cli -- provider set deepseek --api-base https://api.deepseek.com --api-key-env DEEPSEEK_API_KEY --model-name deepseek-chat
 cargo run -p zetta-cli -- --provider deepseek run --prompt "hello from DeepSeek profile"
 OPENAI_API_KEY=... cargo run -p zetta-cli -- --model-driver openai-compatible --model-name gpt-4o-mini run --prompt "hello from remote"
@@ -136,10 +143,10 @@ To inspect a saved session:
 
 ```bash
 cargo run -p zetta-cli -- session show --session-id <uuid>
+cargo run -p zetta-cli -- session overview --session-id <uuid>
 ```
 
 ## Config Precedence
-
 Runtime config is merged in this order:
 
 1. workspace baseline files under `.zetta/project-permissions.json` and `.zetta/project-hooks.json`
@@ -157,6 +164,13 @@ Runtime config is merged in this order:
   `--stream-output` enables incremental assistant deltas on stderr for model calls.
   `--request-timeout-seconds`, `--max-model-retries`, and `--retry-backoff-millis` control request timeout and retry behavior for transient provider failures.
   Malformed `/tool ...` responses are treated as structured tool-feedback instead of a final answer, which lets the model self-correct on the next planning step.
+
+## Terminal UX
+
+- `--ui-mode off` disables live stderr presentation
+- `--ui-mode pretty` prints compact live turn progress to stderr
+- `--ui-mode json` streams raw `EngineEvent` JSON to stderr
+- `run --json` still writes the final event list to stdout; `--ui-mode` only affects the live stderr presenter
 
 ### OpenAI-Compatible Providers
 
@@ -218,4 +232,5 @@ Profiles are stored under `--config-dir/providers.json`. CLI flags still overrid
 1. `P0`: runtime core, tools, permissions, hooks, sessions
 2. `P1`: interactive CLI and REPL ergonomics
 3. `P2`: model/provider depth and native tool-calling
-4. `P3`: next stage, focused on product UX and integrations
+4. `P3`: terminal UX, live turn presentation, and session overviews
+5. `P4`: next stage, focused on integrations and external surfaces

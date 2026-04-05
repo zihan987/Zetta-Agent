@@ -691,6 +691,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_pipeline_denial_suggests_file_tools() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        let context = ToolUseContext::new(
+            temp_dir.path(),
+            PermissionPolicy::new(
+                PermissionMode::WorkspaceWrite,
+                temp_dir.path(),
+                PermissionRules::default(),
+            )?,
+        )?;
+        let registry = build_registry();
+
+        let error = registry
+            .invoke(
+                &ToolCall {
+                    name: "bash".to_string(),
+                    input: json!({
+                        "command": "find . -type f | head -20"
+                    }),
+                },
+                &context,
+            )
+            .await
+            .expect_err("pipeline should be denied");
+
+        let message = error.to_string();
+        assert!(message.contains("pipelines"));
+        assert!(message.contains("glob"));
+        assert!(message.contains("grep"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shell_restrictions_are_skipped_in_bypass_mode() -> anyhow::Result<()> {
         let temp_dir = tempdir()?;
         let context = ToolUseContext::new(
@@ -894,6 +928,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glob_limits_large_result_sets() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        std::fs::create_dir_all(temp_dir.path().join("src"))?;
+        for index in 0..5 {
+            std::fs::write(
+                temp_dir.path().join(format!("src/file{index}.rs")),
+                format!("fn item_{index}() {{}}\n"),
+            )?;
+        }
+
+        let context = ToolUseContext::new(
+            temp_dir.path(),
+            PermissionPolicy::new(
+                PermissionMode::WorkspaceWrite,
+                temp_dir.path(),
+                PermissionRules::default(),
+            )?,
+        )?;
+        let registry = build_registry();
+
+        let glob_result = registry
+            .invoke(
+                &ToolCall {
+                    name: "glob".to_string(),
+                    input: json!({
+                        "pattern": "src/*.rs",
+                        "max_results": 2
+                    }),
+                },
+                &context,
+            )
+            .await?;
+
+        let matches = glob_result.output["matches"]
+            .as_array()
+            .expect("glob matches");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(glob_result.output["truncated"], json!(true));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn grep_and_glob_skip_sensitive_entries() -> anyhow::Result<()> {
         let temp_dir = tempdir()?;
         std::fs::create_dir_all(temp_dir.path().join(".git"))?;
@@ -944,6 +1021,54 @@ mod tests {
             .expect("grep matches");
         assert_eq!(grep_matches.len(), 1);
         assert_eq!(grep_matches[0]["path"], "visible.txt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn glob_skips_runtime_state_and_build_outputs() -> anyhow::Result<()> {
+        let temp_dir = tempdir()?;
+        std::fs::create_dir_all(temp_dir.path().join(".zetta/sessions"))?;
+        std::fs::create_dir_all(temp_dir.path().join("target/debug"))?;
+        std::fs::write(temp_dir.path().join("visible.txt"), "hello")?;
+        std::fs::write(temp_dir.path().join(".zetta/project-hooks.json"), "{}")?;
+        std::fs::write(temp_dir.path().join(".zetta/sessions/a.json"), "{}")?;
+        std::fs::write(temp_dir.path().join("target/debug/app"), "binary")?;
+
+        let context = ToolUseContext::new(
+            temp_dir.path(),
+            PermissionPolicy::new(
+                PermissionMode::WorkspaceWrite,
+                temp_dir.path(),
+                PermissionRules::default(),
+            )?,
+        )?;
+        let registry = build_registry();
+
+        let glob_result = registry
+            .invoke(
+                &ToolCall {
+                    name: "glob".to_string(),
+                    input: json!({
+                        "pattern": "*"
+                    }),
+                },
+                &context,
+            )
+            .await?;
+
+        let glob_matches = glob_result.output["matches"]
+            .as_array()
+            .expect("glob matches")
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(glob_matches.contains(&"visible.txt".to_string()));
+        assert!(!glob_matches
+            .iter()
+            .any(|path| path.contains(".zetta/sessions")));
+        assert!(!glob_matches.iter().any(|path| path.starts_with("target/")));
+
         Ok(())
     }
 

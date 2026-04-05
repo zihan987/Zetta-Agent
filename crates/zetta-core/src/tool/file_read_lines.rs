@@ -14,7 +14,7 @@ impl Tool for FileReadLinesTool {
     }
 
     fn description(&self) -> &'static str {
-        "Reads an inclusive line range from a UTF-8 file inside a readable root."
+        "Reads an inclusive line range from a UTF-8 file inside a readable root. Prefer this for focused inspection before edits."
     }
 
     fn capability(&self) -> ToolCapability {

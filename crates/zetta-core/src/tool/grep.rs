@@ -15,7 +15,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Recursively searches UTF-8 text files for a substring."
+        "Recursively searches UTF-8 text files for a substring. Prefer this over shell grep/find pipelines when searching code."
     }
 
     fn capability(&self) -> ToolCapability {
