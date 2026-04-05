@@ -92,6 +92,26 @@ impl PermissionPolicy {
     }
 
     #[must_use]
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    #[must_use]
+    pub fn readable_roots(&self) -> &[PathBuf] {
+        &self.readable_roots
+    }
+
+    #[must_use]
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+
+    #[must_use]
     pub fn is_tool_visible(&self, tool_name: &str, capability: ToolCapability) -> bool {
         self.check_tool_allowed(tool_name, capability).is_ok()
     }

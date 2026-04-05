@@ -1,10 +1,10 @@
 # Zetta Minimal Usage
 
-This is the shortest practical guide for using the current `P0` Zetta CLI runtime.
+This is the shortest practical guide for using the current `v0.1.0` Zetta CLI and REPL.
 
 ## What It Is
 
-Zetta is currently a headless agent CLI.
+Zetta is currently a CLI-first agent runtime with an interactive REPL.
 
 It can:
 
@@ -32,6 +32,55 @@ Use the default local placeholder model:
 
 ```bash
 cargo run -p zetta-cli -- run --prompt "hello"
+```
+
+Start an interactive REPL:
+
+```bash
+cargo run -p zetta-cli -- repl
+```
+
+Local REPL commands:
+
+- `:help`
+- `:session`
+- `:tools`
+- `:history`
+- `:search <text>`
+- `:last`
+- `:write <path>`
+- `:show`
+- `:new`
+- `:reset`
+- `:trim <turns>`
+- `:retry`
+- `:rerun <turns_back>`
+- `:export <path>`
+- `:provider`
+- `:provider use <name>`
+- `:provider clear`
+- `:config`
+- `:mode`
+- `:mode <read-only|workspace-write|bypass-permissions>`
+- `:events`
+- `:events on|off`
+- `:json`
+- `:json on|off`
+- `:load <session_id>`
+- `:fork`
+- `:exit`
+- `:quit`
+
+Create and use a provider profile:
+
+```bash
+cargo run -p zetta-cli -- provider set deepseek \
+  --api-base https://api.deepseek.com \
+  --api-key-env DEEPSEEK_API_KEY \
+  --model-name deepseek-chat
+
+cargo run -p zetta-cli -- --provider deepseek run --prompt "Review the auth flow"
+cargo run -p zetta-cli -- --provider deepseek repl
 ```
 
 Ask it to use tools:
@@ -110,6 +159,8 @@ If a provider is OpenAI-compatible, Zetta currently only needs:
 - `--api-base`
 - `--model-name`
 - `--api-key-env`
+
+If you save a provider profile with `provider set`, `--provider <name>` can fill these values for you.
 
 ## Direct Tool Use
 

@@ -1,0 +1,29 @@
+# Changelog
+
+## v0.1.0
+
+First usable Zetta release.
+
+Included in this release:
+
+- `P0` core runtime is complete:
+  - bounded multi-step agent loop
+  - tool registry with file/search/bash primitives
+  - permission policy and path protections
+  - session persistence
+  - hook policy and JSONL hook logging
+  - OpenAI-compatible model driver with timeout/retry/backoff
+- `P1` interactive CLI is complete:
+  - `repl`
+  - provider profile switching
+  - session history/search/export helpers
+  - retry/rerun/trim workflow
+  - lightweight REPL status prompt
+  - event and JSON tracing toggles
+
+Known limits:
+
+- no full-screen terminal UI
+- no native provider tool-calling integration yet
+- no MCP / remote / IDE bridge yet
+- OpenAI-compatible providers still rely on the text `/tool ...` fallback protocol

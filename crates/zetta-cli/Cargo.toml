@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Interactive CLI and REPL for the Zetta Rust agent runtime"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

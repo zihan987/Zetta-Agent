@@ -1,10 +1,10 @@
 # Zetta 使用指南
 
-这是当前 `P0` 阶段 Zetta CLI runtime 的中文使用指南。
+这是当前 `v0.1.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
 
 ## 它现在是什么
 
-Zetta 目前是一个无界面的 agent CLI。
+Zetta 目前是一个以 CLI 和 REPL 为主的 agent runtime。
 
 它可以：
 
@@ -32,6 +32,55 @@ cargo test
 
 ```bash
 cargo run -p zetta-cli -- run --prompt "hello"
+```
+
+启动交互式 REPL：
+
+```bash
+cargo run -p zetta-cli -- repl
+```
+
+REPL 内置本地命令：
+
+- `:help`
+- `:session`
+- `:tools`
+- `:history`
+- `:search <text>`
+- `:last`
+- `:write <path>`
+- `:show`
+- `:new`
+- `:reset`
+- `:trim <turns>`
+- `:retry`
+- `:rerun <turns_back>`
+- `:export <path>`
+- `:provider`
+- `:provider use <name>`
+- `:provider clear`
+- `:config`
+- `:mode`
+- `:mode <read-only|workspace-write|bypass-permissions>`
+- `:events`
+- `:events on|off`
+- `:json`
+- `:json on|off`
+- `:load <session_id>`
+- `:fork`
+- `:exit`
+- `:quit`
+
+创建并使用 provider profile：
+
+```bash
+cargo run -p zetta-cli -- provider set deepseek \
+  --api-base https://api.deepseek.com \
+  --api-key-env DEEPSEEK_API_KEY \
+  --model-name deepseek-chat
+
+cargo run -p zetta-cli -- --provider deepseek run --prompt "检查认证流程"
+cargo run -p zetta-cli -- --provider deepseek repl
 ```
 
 让它自己决定是否使用工具：
@@ -110,6 +159,8 @@ cargo run -p zetta-cli -- \
 - `--api-base`
 - `--model-name`
 - `--api-key-env`
+
+如果先用 `provider set` 保存好了 profile，后面可以直接用 `--provider <name>` 自动补这些值。
 
 ## 直接调用工具
 

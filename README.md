@@ -6,17 +6,27 @@ Docs:
 
 - English minimal usage: `MINIMAL_USAGE.md`
 - 中文使用指南：`MINIMAL_USAGE.zh-CN.md`
+- Changelog: `CHANGELOG.md`
+- Roadmap: `ROADMAP.md`
+
+## Release Status
+
+Current release target: `v0.1.0`
+
+- `P0` complete: runtime core, permissions, hooks, sessions, OpenAI-compatible model driver
+- `P1` complete: interactive REPL and CLI ergonomics
+- Next focus: provider/native tool-calling depth and richer execution visibility
 
 ## Current Scope
 
-The current workspace builds a staged headless core:
+The current workspace ships a usable CLI agent runtime:
 
 - protocol types for messages, tool calls, sessions, and events
 - a bounded multi-step engine for repeated model planning and tool execution
 - pluggable model and tool traits
 - JSON session persistence
-- a small CLI to exercise the core
-- a phase-2 permission boundary and core tools
+- an interactive CLI and REPL
+- a permission boundary and core tools
 - rule-based tool visibility and allow/deny policy
 - persistent global and session-level permission config
 - a safe internal hook/event bus with optional JSONL logging
@@ -38,14 +48,56 @@ This intentionally does **not** include:
 
 - `crates/zetta-protocol`: shared serializable types
 - `crates/zetta-core`: engine, tool registry, model abstraction, session store
-- `crates/zetta-cli`: phase-2 executable
+- `crates/zetta-cli`: user-facing CLI and REPL
+
+## REPL
+
+`P1` starts with a lightweight interactive CLI loop:
+
+```bash
+cargo run -p zetta-cli -- repl
+```
+
+Local REPL commands:
+
+- `:help`
+- `:session`
+- `:tools`
+- `:history`
+- `:search <text>`
+- `:last`
+- `:write <path>`
+- `:show`
+- `:new`
+- `:reset`
+- `:trim <turns>`
+- `:retry`
+- `:rerun <turns_back>`
+- `:export <path>`
+- `:provider`
+- `:provider use <name>`
+- `:provider clear`
+- `:config`
+- `:mode`
+- `:mode <read-only|workspace-write|bypass-permissions>`
+- `:events`
+- `:events on|off`
+- `:json`
+- `:json on|off`
+- `:load <session_id>`
+- `:fork`
+- `:exit`
+- `:quit`
 
 ## Quick Start
 
 ```bash
 cd Zetta-Agent
 cargo run -p zetta-cli -- run --prompt "hello"
+cargo run -p zetta-cli -- repl
 cargo run -p zetta-cli -- run --prompt "/tool echo staged rewrite"
+cargo run -p zetta-cli -- provider set deepseek --api-base https://api.deepseek.com --api-key-env DEEPSEEK_API_KEY --model-name deepseek-chat
+cargo run -p zetta-cli -- --provider deepseek run --prompt "hello from DeepSeek profile"
 OPENAI_API_KEY=... cargo run -p zetta-cli -- --model-driver openai-compatible --model-name gpt-4o-mini run --prompt "hello from remote"
 OPENAI_API_KEY=... cargo run -p zetta-cli -- --model-driver openai-compatible --model-name gpt-4o-mini --stream-output run --prompt "hello from remote"
 OPENAI_API_KEY=... cargo run -p zetta-cli -- --model-driver openai-compatible --model-name gpt-4o-mini --request-timeout-seconds 60 --max-model-retries 3 --retry-backoff-millis 750 run --prompt "retryable provider demo"
@@ -138,6 +190,22 @@ ZHIPU_API_KEY=... cargo run -p zetta-cli -- \
   --model-name glm-5 \
   run --prompt "Summarize the project structure"
 ```
+
+Provider profiles:
+
+```bash
+cargo run -p zetta-cli -- provider set deepseek \
+  --api-base https://api.deepseek.com \
+  --api-key-env DEEPSEEK_API_KEY \
+  --model-name deepseek-chat
+
+cargo run -p zetta-cli -- provider list
+cargo run -p zetta-cli -- provider show deepseek
+cargo run -p zetta-cli -- --provider deepseek run --prompt "Inspect the repository layout"
+cargo run -p zetta-cli -- --provider deepseek repl
+```
+
+Profiles are stored under `--config-dir/providers.json`. CLI flags still override profile values when both are present.
 
 ## Phase Plan
 

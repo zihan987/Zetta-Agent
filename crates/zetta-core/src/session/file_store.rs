@@ -23,6 +23,15 @@ impl FileSessionStore {
     fn session_path(&self, session_id: &SessionId) -> PathBuf {
         self.root.join(format!("{session_id}.json"))
     }
+
+    pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
+        let path = self.session_path(session_id);
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[async_trait]
