@@ -11,11 +11,12 @@ Docs:
 
 ## Release Status
 
-Current release target: `v0.1.0`
+Current release target: `v0.2.0`
 
 - `P0` complete: runtime core, permissions, hooks, sessions, OpenAI-compatible model driver
 - `P1` complete: interactive REPL and CLI ergonomics
-- Next focus: provider/native tool-calling depth and richer execution visibility
+- `P2` complete: native tool-calling for OpenAI-compatible providers with text fallback preserved
+- Next focus: `P3` product UX and integrations
 
 ## Current Scope
 
@@ -34,6 +35,7 @@ The current workspace ships a usable CLI agent runtime:
 - persistent global and session-level hook policy config
 - workspace baseline config auto-loaded from `.zetta/project-permissions.json` and `.zetta/project-hooks.json`
 - optional `openai-compatible` model driver for real remote completions
+- native tool-calling for OpenAI-compatible providers, with the existing `/tool ...` path kept as a fallback
 - invalid `/tool ...` attempts are fed back into the transcript so the model can correct and retry within the same turn
 
 This intentionally does **not** include:
@@ -52,7 +54,7 @@ This intentionally does **not** include:
 
 ## REPL
 
-`P1` starts with a lightweight interactive CLI loop:
+Zetta includes a lightweight interactive CLI loop:
 
 ```bash
 cargo run -p zetta-cli -- repl
@@ -150,6 +152,8 @@ Runtime config is merged in this order:
 - `rule-based`: default local placeholder used for deterministic development
 - `openai-compatible`: minimal remote chat client using `--model-name`, optional `--api-base`, and an API key from `OPENAI_API_KEY` or `--api-key-env`
   If `--system-prompt` is omitted, the CLI builds a default tool-oriented prompt from the currently visible tools.
+  When the provider supports OpenAI-style native tool-calling, Zetta will use it automatically.
+  If native tool-calling is not used, the runtime still falls back to the text `/tool ...` protocol.
   `--stream-output` enables incremental assistant deltas on stderr for model calls.
   `--request-timeout-seconds`, `--max-model-retries`, and `--retry-backoff-millis` control request timeout and retry behavior for transient provider failures.
   Malformed `/tool ...` responses are treated as structured tool-feedback instead of a final answer, which lets the model self-correct on the next planning step.
@@ -157,6 +161,8 @@ Runtime config is merged in this order:
 ### OpenAI-Compatible Providers
 
 Any provider that accepts an OpenAI-style `POST {base_url}/chat/completions` request can be used with the current runtime.
+
+If the provider also supports OpenAI-style native tool-calling, Zetta will send tool definitions automatically and parse native tool calls before falling back to text parsing.
 
 Generic custom endpoint:
 
@@ -207,10 +213,9 @@ cargo run -p zetta-cli -- --provider deepseek repl
 
 Profiles are stored under `--config-dir/providers.json`. CLI flags still override profile values when both are present.
 
-## Phase Plan
+## Phase Status
 
-1. Phase 1: headless engine skeleton and persistence
-2. Phase 2: real shell/file/search tools plus permission boundary
-3. Phase 3: streaming model client and richer tool loop
-4. Phase 4: TUI layer
-5. Phase 5: MCP / remote / IDE bridge
+1. `P0`: runtime core, tools, permissions, hooks, sessions
+2. `P1`: interactive CLI and REPL ergonomics
+3. `P2`: model/provider depth and native tool-calling
+4. `P3`: next stage, focused on product UX and integrations

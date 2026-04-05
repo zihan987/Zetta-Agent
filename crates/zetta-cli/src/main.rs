@@ -1925,16 +1925,16 @@ fn build_model_client(
         .model_name
         .ok_or_else(|| anyhow::anyhow!("`--model-name` is required for `openai-compatible`"))?;
 
+    let default_system_prompt = default_openai_system_prompt(&visible_tools);
     let mut config = OpenAiCompatibleConfig::new(api_key, model_name);
     if let Some(api_base) = resolved.api_base {
         config.api_base = api_base;
     }
+    config.tools = visible_tools;
     config.request_timeout = Duration::from_secs(cli.request_timeout_seconds);
     config.max_retries = cli.max_model_retries;
     config.retry_backoff = Duration::from_millis(cli.retry_backoff_millis);
-    config.system_prompt = resolved
-        .system_prompt
-        .or_else(|| Some(default_openai_system_prompt(&visible_tools)));
+    config.system_prompt = resolved.system_prompt.or(Some(default_system_prompt));
 
     Ok(Arc::new(OpenAiCompatibleModelClient::new(config)?))
 }
@@ -1965,7 +1965,7 @@ fn default_openai_system_prompt(visible_tools: &[ToolDefinition]) -> String {
 
     format!(
         "You are a coding agent operating in a CLI environment.\n\
-Use tools when they materially help. When invoking a tool, respond with exactly one line in the form `/tool <name> <payload>` and no extra text.\n\
+Use tools when they materially help. Prefer native tool-calling when the model/runtime supports it. If native tool-calling is unavailable, respond with exactly one line in the form `/tool <name> <payload>` and no extra text.\n\
 Use JSON payloads for structured arguments.\n\
 {workflow_block}\n\
 When you have enough information, reply normally with the final answer instead of calling another tool.\n\

@@ -1,6 +1,6 @@
 # Zetta 使用指南
 
-这是当前 `v0.1.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
+这是当前 `v0.2.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
 
 ## 它现在是什么
 
@@ -102,6 +102,8 @@ cargo run -p zetta-cli -- \
   --model-name gpt-4o-mini \
   run --prompt "检查 src/main.rs，并总结入口逻辑"
 ```
+
+如果 provider 支持 OpenAI 风格的原生 tool-calling，Zetta 会自动优先使用；如果不支持，仍然会回退到文本 `/tool ...` 协议。
 
 常用运行时参数：
 

@@ -1,6 +1,6 @@
 # Zetta Minimal Usage
 
-This is the shortest practical guide for using the current `v0.1.0` Zetta CLI and REPL.
+This is the shortest practical guide for using the current `v0.2.0` Zetta CLI and REPL.
 
 ## What It Is
 
@@ -102,6 +102,8 @@ cargo run -p zetta-cli -- \
   --model-name gpt-4o-mini \
   run --prompt "Inspect src/main.rs and summarize the entrypoint"
 ```
+
+When the provider supports native OpenAI-style tool-calling, Zetta will use that automatically. If it does not, Zetta falls back to the text `/tool ...` protocol.
 
 Useful runtime knobs:
 

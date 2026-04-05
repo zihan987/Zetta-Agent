@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.0
+
+P2 model/provider depth release.
+
+Included in this release:
+
+- OpenAI-compatible models now advertise native tool schemas
+- OpenAI-compatible responses now prefer native tool-calling over the text `/tool ...` fallback
+- streaming responses can accumulate native tool-call deltas
+- the text `/tool ...` path remains as a compatibility fallback for providers that do not support native tool-calling cleanly
+
+This release keeps the existing CLI/REPL surface from `v0.1.0`, and deepens model/provider behavior instead of changing the user workflow.
+
 ## v0.1.0
 
 First usable Zetta release.

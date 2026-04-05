@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "zetta-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "zetta-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "zetta-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
