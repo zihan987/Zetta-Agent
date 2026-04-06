@@ -15,19 +15,23 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Error, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::style::Print;
+use crossterm::execute;
 use crossterm::terminal::{
-    self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::{execute, queue};
 use hook_config::{merge_hook_configs, HookConfigStore, HookScope, PersistentHookConfig};
 use permission_config::{
     merge_permission_configs, PermissionConfigStore, PermissionScope, PersistentPermissionConfig,
 };
 use provider_config::{PersistentProviderProfile, ProviderConfigStore};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::Terminal;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -49,6 +53,10 @@ use zetta_protocol::{SessionId, ToolCall, TurnRequest};
 const PROJECT_CONFIG_DIRNAME: &str = ".zetta";
 const PROJECT_PERMISSION_CONFIG_FILENAME: &str = "project-permissions.json";
 const PROJECT_HOOK_CONFIG_FILENAME: &str = "project-hooks.json";
+const TUI_COMPOSER_HEIGHT: u16 = 8;
+const TUI_FOOTER_HEIGHT: u16 = 1;
+
+type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 #[derive(Parser)]
 #[command(name = "zetta")]
@@ -1163,31 +1171,38 @@ async fn run_tui(
 
     let session_id = session_id.unwrap_or_default();
     let session = store.load(&session_id).await?;
-    let stdout = io::stdout();
-
     enable_raw_mode()?;
-    execute!(
-        stdout.lock(),
-        EnterAlternateScreen,
-        Clear(ClearType::All),
-        Show
-    )?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, Show)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.clear()?;
     let _guard = TuiTerminalGuard;
 
-    let runtime = Arc::new(Mutex::new(TuiRuntime::new(TuiState {
-        session_id,
-        active_provider: cli.provider.clone(),
-        permission_mode: cli.permission_mode,
-        input: String::new(),
-        pending_assistant: String::new(),
-        event_lines: vec![
-            "F1 help | Enter submit | Esc exit | Ctrl+N new session | Ctrl+L redraw | Ctrl+U clear input"
-                .to_string(),
-        ],
-        last_error: None,
-        busy: false,
-        session,
-    })));
+    let runtime = Arc::new(Mutex::new(TuiRuntime::new(
+        TuiState {
+            session_id,
+            active_provider: cli.provider.clone(),
+            permission_mode: cli.permission_mode,
+            input: String::new(),
+            pending_assistant: String::new(),
+            activity_entries: vec![TuiActivityEntry {
+                badge: "HELP".to_string(),
+                title: "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity"
+                    .to_string(),
+                detail: Some(
+                    "Esc exit • Ctrl+N new session • Ctrl+L redraw • Ctrl+U clear input"
+                        .to_string(),
+                ),
+                tone: ActivityTone::Neutral,
+            }],
+            last_error: None,
+            busy: false,
+            session,
+            transcript_scroll: 0,
+            activity_scroll: 0,
+        },
+        terminal,
+    )));
 
     runtime.lock().expect("tui runtime").render()?;
 
@@ -1290,16 +1305,23 @@ async fn run_tui_turn(
             runtime.state.session_id = output.session.session_id;
             runtime.state.session = Some(output.session);
             for failure in output.hook_failures {
-                runtime.push_event_line(format!(
-                    "[hook] {} failed: {}",
-                    failure.handler_name, failure.error
-                ));
+                runtime.push_activity_entry(TuiActivityEntry {
+                    badge: "HOOK".to_string(),
+                    title: format!("{} failed", failure.handler_name),
+                    detail: Some(failure.error),
+                    tone: ActivityTone::Warning,
+                });
             }
         }
         Err(error) => {
             let message = render_cli_error_lines(&error).join(" | ");
             runtime.state.last_error = Some(message.clone());
-            runtime.push_event_line(format!("[error] {message}"));
+            runtime.push_activity_entry(TuiActivityEntry {
+                badge: "ERR".to_string(),
+                title: "model request failed".to_string(),
+                detail: Some(message),
+                tone: ActivityTone::Error,
+            });
         }
     }
 
@@ -1319,6 +1341,11 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => return Ok(TuiAction::Exit),
+            KeyCode::Char('j') => {
+                runtime.state.input.push('\n');
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
             KeyCode::Char('l') => {
                 runtime.render()?;
                 return Ok(TuiAction::None);
@@ -1332,6 +1359,7 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
                 runtime.state.session_id = SessionId::new();
                 runtime.state.session = None;
                 runtime.state.pending_assistant.clear();
+                runtime.reset_scrolls();
                 let session_id = runtime.state.session_id;
                 runtime.push_event_line(format!("[session] switched to {session_id}"));
                 runtime.render()?;
@@ -1343,11 +1371,29 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
 
     match key.code {
         KeyCode::Esc => return Ok(TuiAction::Exit),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            runtime.scroll_activity(8);
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            runtime.scroll_activity(-8);
+        }
+        KeyCode::Up if key.modifiers.is_empty() => {
+            runtime.scroll_transcript(8);
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            runtime.scroll_transcript(-8);
+        }
         KeyCode::F(1) => {
-            runtime.push_event_line(
-                "[help] Enter submit | Esc exit | Ctrl+N new session | Ctrl+U clear input | Ctrl+L redraw"
+            runtime.push_activity_entry(TuiActivityEntry {
+                badge: "HELP".to_string(),
+                title: "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity"
                     .to_string(),
-            );
+                detail: Some(
+                    "Esc exit • Ctrl+N new session • Ctrl+U clear input • Ctrl+L redraw"
+                        .to_string(),
+                ),
+                tone: ActivityTone::Neutral,
+            });
         }
         KeyCode::Backspace => {
             runtime.state.input.pop();
@@ -1599,7 +1645,7 @@ fn render_repl_prompt(
     active_provider: Option<&str>,
     permission_mode: Option<CliPermissionMode>,
 ) -> String {
-    let short_session = session_id.to_string().chars().take(8).collect::<String>();
+    let short_session = short_session_id(&session_id.to_string());
     let mode = permission_mode
         .unwrap_or(CliPermissionMode::WorkspaceWrite)
         .short_label();
@@ -1607,6 +1653,10 @@ fn render_repl_prompt(
         Some(provider) => format!("zetta[{short_session} {mode} {provider}]> "),
         None => format!("zetta[{short_session} {mode}]> "),
     }
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
 }
 
 fn print_session_summary(session: &zetta_protocol::SessionSnapshot) {
@@ -2010,105 +2060,585 @@ struct TuiState {
     permission_mode: Option<CliPermissionMode>,
     input: String,
     pending_assistant: String,
-    event_lines: Vec<String>,
+    activity_entries: Vec<TuiActivityEntry>,
     last_error: Option<String>,
     busy: bool,
     session: Option<zetta_protocol::SessionSnapshot>,
+    transcript_scroll: usize,
+    activity_scroll: usize,
+}
+
+#[derive(Clone, Debug)]
+struct StyledTextLine {
+    text: String,
+    style: Style,
+}
+
+impl StyledTextLine {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::default(),
+        }
+    }
+
+    fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TuiActivityEntry {
+    badge: String,
+    title: String,
+    detail: Option<String>,
+    tone: ActivityTone,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActivityTone {
+    Neutral,
+    Running,
+    Success,
+    Warning,
+    Error,
+    Assistant,
+}
+
+impl ActivityTone {
+    fn title_style(self) -> Style {
+        match self {
+            Self::Neutral => Style::default().fg(Color::Gray),
+            Self::Running => Style::default().fg(Color::LightCyan),
+            Self::Success => Style::default().fg(Color::LightGreen),
+            Self::Warning => Style::default().fg(Color::Yellow),
+            Self::Error => Style::default().fg(Color::LightRed),
+            Self::Assistant => Style::default().fg(Color::White),
+        }
+    }
+
+    fn detail_style(self) -> Style {
+        match self {
+            Self::Error => Style::default().fg(Color::Red),
+            Self::Warning => Style::default().fg(Color::DarkGray),
+            Self::Running => Style::default().fg(Color::DarkGray),
+            Self::Success => Style::default().fg(Color::DarkGray),
+            Self::Assistant => subtle_text(Color::DarkGray),
+            Self::Neutral => subtle_text(Color::DarkGray),
+        }
+    }
 }
 
 struct TuiRuntime {
     state: TuiState,
+    terminal: TuiTerminal,
 }
 
 impl TuiRuntime {
-    fn new(state: TuiState) -> Self {
-        Self { state }
+    fn new(state: TuiState, terminal: TuiTerminal) -> Self {
+        Self { state, terminal }
     }
 
-    fn push_event_line(&mut self, line: String) {
-        self.state.event_lines.push(line);
-        const MAX_EVENT_LINES: usize = 200;
-        if self.state.event_lines.len() > MAX_EVENT_LINES {
-            let trim = self.state.event_lines.len() - MAX_EVENT_LINES;
-            self.state.event_lines.drain(0..trim);
+    fn push_activity_entry(&mut self, entry: TuiActivityEntry) {
+        self.state.activity_entries.push(entry);
+        const MAX_ACTIVITY_ENTRIES: usize = 200;
+        if self.state.activity_entries.len() > MAX_ACTIVITY_ENTRIES {
+            let trim = self.state.activity_entries.len() - MAX_ACTIVITY_ENTRIES;
+            self.state.activity_entries.drain(0..trim);
         }
     }
 
+    fn push_event_line(&mut self, line: String) {
+        self.push_activity_entry(TuiActivityEntry {
+            badge: "NOTE".to_string(),
+            title: line,
+            detail: None,
+            tone: ActivityTone::Neutral,
+        });
+    }
+
+    fn scroll_transcript(&mut self, delta: isize) {
+        self.state.transcript_scroll = apply_scroll_delta(self.state.transcript_scroll, delta);
+    }
+
+    fn scroll_activity(&mut self, delta: isize) {
+        self.state.activity_scroll = apply_scroll_delta(self.state.activity_scroll, delta);
+    }
+
+    fn reset_scrolls(&mut self) {
+        self.state.transcript_scroll = 0;
+        self.state.activity_scroll = 0;
+    }
+
     fn render(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
-        let (cols, rows) = terminal::size()?;
-        queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-
-        let input_height = 4u16;
-        let status_width = if cols >= 80 {
-            36.min(cols.saturating_sub(24))
-        } else if cols >= 64 {
-            24.min(cols.saturating_sub(24))
-        } else {
-            0
-        };
-        let transcript_width = if status_width == 0 {
-            cols
-        } else {
-            cols.saturating_sub(status_width)
-        };
-        let top_height = rows.saturating_sub(input_height);
-
-        let transcript_lines = tui_transcript_lines(&self.state);
-        let status_lines = tui_status_lines(&self.state);
-        let input_lines = tui_input_lines(&self.state);
-
-        draw_box(
-            &mut stdout,
-            0,
-            0,
-            transcript_width,
-            top_height,
-            "Transcript",
-            &transcript_lines,
-        )?;
-        draw_box(
-            &mut stdout,
-            transcript_width,
-            0,
-            status_width,
-            top_height,
-            "Status",
-            &status_lines,
-        )?;
-        draw_box(
-            &mut stdout,
-            0,
-            top_height,
-            cols,
-            input_height,
-            if self.state.busy {
-                "Input (running...)"
-            } else {
-                "Input"
-            },
-            &input_lines,
-        )?;
-
-        let cursor_y = top_height
-            .saturating_add(1)
-            .saturating_add(input_lines.len().saturating_sub(1) as u16);
-        let cursor_x = 1u16.saturating_add(
-            input_lines
-                .last()
-                .map(|line| display_width(line) as u16)
-                .unwrap_or(0),
-        );
-        queue!(
-            stdout,
-            MoveTo(
-                cursor_x.min(cols.saturating_sub(1)),
-                cursor_y.min(rows.saturating_sub(1))
-            )
-        )?;
-        stdout.flush()?;
+        let state = &self.state;
+        self.terminal.draw(|frame| render_tui_frame(frame, state))?;
         Ok(())
     }
+}
+
+fn apply_scroll_delta(current: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        current.saturating_add(delta as usize)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    }
+}
+
+fn pane_title(base: &str, scroll: usize) -> String {
+    let _ = scroll;
+    format!(" {base} ")
+}
+
+fn panel_block(title: String, color: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(title, Style::default().fg(color)))
+}
+
+fn subtle_text(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
+fn transcript_role_style(role: zetta_protocol::MessageRole) -> (Style, Style) {
+    match role {
+        zetta_protocol::MessageRole::System => (
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            subtle_text(Color::Gray),
+        ),
+        zetta_protocol::MessageRole::User => (
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        ),
+        zetta_protocol::MessageRole::Assistant => (
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Gray),
+        ),
+        zetta_protocol::MessageRole::Tool => (
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            subtle_text(Color::Gray),
+        ),
+    }
+}
+
+fn render_tui_frame(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(TUI_COMPOSER_HEIGHT),
+            Constraint::Length(TUI_FOOTER_HEIGHT),
+        ])
+        .split(area);
+
+    render_tui_header(frame, vertical[0], state);
+
+    let body = vertical[1];
+    let body_chunks = if body.width >= 96 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(36)])
+            .split(body)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(13)])
+            .split(body)
+    };
+
+    let transcript_area = body_chunks[0];
+    let side_area = body_chunks[1];
+    let side_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(4)])
+        .split(side_area);
+
+    render_transcript_pane(frame, transcript_area, state);
+    render_overview_pane(frame, side_chunks[0], state);
+    render_activity_pane(frame, side_chunks[1], state);
+    render_composer_pane(frame, vertical[2], state);
+    render_footer(frame, vertical[3], state);
+}
+
+fn render_tui_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let provider = state.active_provider.as_deref().unwrap_or("placeholder");
+    let mode = state
+        .permission_mode
+        .unwrap_or(CliPermissionMode::WorkspaceWrite)
+        .as_str();
+    let state_label = if state.busy { "RUNNING" } else { "IDLE" };
+    let state_style = if state.busy {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let session = state.session_id.to_string();
+    let session_short = short_session_id(&session);
+
+    let line = Line::from(vec![
+        Span::styled(
+            " Zetta ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(58, 96, 148))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            subtle_text(Color::DarkGray),
+        ),
+        Span::raw("   "),
+        Span::styled("provider", subtle_text(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(provider.to_string(), Style::default().fg(Color::Gray)),
+        Span::raw("   "),
+        Span::styled("mode", subtle_text(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(mode.to_string(), Style::default().fg(Color::Gray)),
+        Span::raw("   "),
+        Span::styled("session", subtle_text(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(session_short, Style::default().fg(Color::LightYellow)),
+        Span::raw("   "),
+        Span::styled(state_label, state_style),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_transcript_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let block = panel_block(
+        pane_title("Conversation", state.transcript_scroll),
+        if state.busy {
+            Color::LightGreen
+        } else {
+            Color::Gray
+        },
+    );
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let wrapped = wrap_styled_lines(&tui_transcript_lines(state), inner_width.max(1));
+    let lines = scrolled_wrapped_lines(&wrapped, inner_height.max(1), state.transcript_scroll);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_overview_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let block = panel_block(" Overview ".to_string(), Color::Gray);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let wrapped = wrap_styled_lines(&tui_overview_lines(state), inner_width.max(1));
+    let lines = scrolled_wrapped_lines(&wrapped, inner_height.max(1), 0);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_activity_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let block = panel_block(pane_title("Activity", state.activity_scroll), Color::Gray);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let wrapped = wrap_styled_lines(&tui_activity_lines(state), inner_width.max(1));
+    let lines = scrolled_wrapped_lines(&wrapped, inner_height.max(1), state.activity_scroll);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_composer_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let title = if state.busy {
+        " Composer • sending "
+    } else {
+        " Composer "
+    };
+    let block = panel_block(
+        title.to_string(),
+        if state.busy {
+            Color::LightGreen
+        } else {
+            Color::Gray
+        },
+    );
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let (lines, cursor_line, cursor_col) =
+        composer_display_lines(state, inner_width.max(1), inner_height.max(1));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+
+    if !state.busy {
+        frame.set_cursor_position((
+            area.x
+                .saturating_add(1)
+                .saturating_add(cursor_col as u16)
+                .min(area.x.saturating_add(area.width.saturating_sub(2))),
+            area.y
+                .saturating_add(1)
+                .saturating_add(cursor_line as u16)
+                .min(area.y.saturating_add(area.height.saturating_sub(2))),
+        ));
+    }
+}
+
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let provider_hint = if state.active_provider.is_none() {
+        "No provider configured: using local placeholder model. Launch with --provider <name> for a real model."
+    } else {
+        "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity • Ctrl+N new session • Esc exit"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            provider_hint,
+            subtle_text(Color::DarkGray),
+        ))),
+        area,
+    );
+}
+
+fn tui_transcript_lines(state: &TuiState) -> Vec<StyledTextLine> {
+    let mut lines = Vec::new();
+
+    if let Some(session) = &state.session {
+        for message in &session.messages {
+            let (header_style, body_style) = transcript_role_style(message.role.clone());
+            let label = match message.role {
+                zetta_protocol::MessageRole::System => "SYSTEM",
+                zetta_protocol::MessageRole::User => "USER",
+                zetta_protocol::MessageRole::Assistant => "ASSISTANT",
+                zetta_protocol::MessageRole::Tool => "TOOL",
+            };
+            let content = if matches!(message.role, zetta_protocol::MessageRole::Tool) {
+                summarize_tool_result(&message.content)
+            } else {
+                message.content.clone()
+            };
+            lines.push(StyledTextLine::styled(format!("{label}"), header_style));
+            for line in content.lines() {
+                lines.push(StyledTextLine::styled(line.to_string(), body_style));
+            }
+            lines.push(StyledTextLine::plain(String::new()));
+        }
+    } else {
+        lines.push(StyledTextLine::styled(
+            "No messages yet. Start by asking Zetta to inspect or modify files in this workspace.",
+            subtle_text(Color::DarkGray),
+        ));
+    }
+
+    if !state.pending_assistant.is_empty() {
+        lines.push(StyledTextLine::styled(
+            "ASSISTANT • streaming",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for line in state.pending_assistant.lines() {
+            lines.push(StyledTextLine::styled(
+                line.to_string(),
+                Style::default().fg(Color::Rgb(220, 232, 228)),
+            ));
+        }
+    }
+
+    lines
+}
+
+fn tui_overview_lines(state: &TuiState) -> Vec<StyledTextLine> {
+    let mut lines = vec![
+        kv_line(
+            "provider",
+            state.active_provider.as_deref().unwrap_or("<none>"),
+        ),
+        kv_line(
+            "mode",
+            state
+                .permission_mode
+                .unwrap_or(CliPermissionMode::WorkspaceWrite)
+                .as_str(),
+        ),
+        kv_line("state", if state.busy { "running" } else { "idle" }),
+    ];
+
+    if let Some(session) = &state.session {
+        let overview = build_session_overview(session);
+        lines.push(kv_line("turns", &overview.user_turns.to_string()));
+        lines.push(kv_line("messages", &session.messages.len().to_string()));
+        lines.push(kv_line(
+            "tools",
+            &format!(
+                "ok={} deny={} fail={}",
+                overview.completed_tools, overview.denied_tools, overview.failed_tools
+            ),
+        ));
+    }
+
+    if state.active_provider.is_none() {
+        lines.push(StyledTextLine::plain(String::new()));
+        lines.push(StyledTextLine::styled(
+            "Tip: pass --provider <name> to use a real model instead of the local placeholder.",
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    if let Some(error) = &state.last_error {
+        lines.push(StyledTextLine::plain(String::new()));
+        lines.push(StyledTextLine::styled(
+            "Last error",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(StyledTextLine::styled(
+            error.clone(),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+
+    lines
+}
+
+fn tui_activity_lines(state: &TuiState) -> Vec<StyledTextLine> {
+    let mut lines = Vec::new();
+    if state.activity_entries.is_empty() {
+        lines.push(StyledTextLine::styled(
+            "No activity yet.",
+            subtle_text(Color::DarkGray),
+        ));
+        return lines;
+    }
+
+    for entry in state.activity_entries.iter().rev().take(80).rev() {
+        lines.push(StyledTextLine::styled(
+            format!("[{}] {}", entry.badge.to_lowercase(), entry.title),
+            entry.tone.title_style(),
+        ));
+        if let Some(detail) = &entry.detail {
+            lines.push(StyledTextLine::styled(
+                format!("  {}", detail),
+                entry.tone.detail_style(),
+            ));
+        }
+        lines.push(StyledTextLine::plain(String::new()));
+    }
+    lines
+}
+
+fn composer_display_lines(
+    state: &TuiState,
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, usize, usize) {
+    if state.input.is_empty() {
+        return (
+            vec![Line::from(Span::styled(
+                "Type a prompt. Enter sends, Ctrl+J adds a new line.",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            0,
+            0,
+        );
+    }
+
+    let wrapped = wrap_plain_lines(&split_text_lines(&state.input), width.max(1));
+    let visible = take_tail(&wrapped, height.max(1));
+    let cursor_line = visible.len().saturating_sub(1);
+    let cursor_col = visible.last().map(|line| display_width(line)).unwrap_or(0);
+    let rendered = visible
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+        .collect::<Vec<_>>();
+    (rendered, cursor_line, cursor_col)
+}
+
+fn wrap_styled_lines(lines: &[StyledTextLine], width: usize) -> Vec<Line<'static>> {
+    let mut wrapped = Vec::new();
+
+    for line in lines {
+        if line.text.is_empty() {
+            wrapped.push(Line::from(Span::styled(String::new(), line.style)));
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.text.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > width && !current.is_empty() {
+                wrapped.push(Line::from(Span::styled(current, line.style)));
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+            if current_width >= width && !current.is_empty() {
+                wrapped.push(Line::from(Span::styled(current, line.style)));
+                current = String::new();
+                current_width = 0;
+            }
+        }
+        if !current.is_empty() {
+            wrapped.push(Line::from(Span::styled(current, line.style)));
+        }
+    }
+
+    wrapped
+}
+
+fn scrolled_wrapped_lines(
+    wrapped: &[Line<'static>],
+    max_lines: usize,
+    scroll: usize,
+) -> Vec<Line<'static>> {
+    let visible_end = wrapped.len().saturating_sub(scroll);
+    let visible_start = visible_end.saturating_sub(max_lines.max(1));
+    wrapped[visible_start..visible_end].to_vec()
+}
+
+fn wrap_plain_lines(lines: &[String], width: usize) -> Vec<String> {
+    let styled = lines
+        .iter()
+        .cloned()
+        .map(StyledTextLine::plain)
+        .collect::<Vec<_>>();
+    wrap_styled_lines(&styled, width.max(1))
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn take_tail<T: Clone>(items: &[T], max_items: usize) -> Vec<T> {
+    let start = items.len().saturating_sub(max_items);
+    items[start..].to_vec()
+}
+
+fn split_text_lines(input: &str) -> Vec<String> {
+    let mut lines = input.lines().map(ToString::to_string).collect::<Vec<_>>();
+    if input.ends_with('\n') {
+        lines.push(String::new());
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn kv_line(label: &str, value: &str) -> StyledTextLine {
+    StyledTextLine::styled(
+        format!("{label:<9} {value}"),
+        Style::default().fg(Color::White),
+    )
 }
 
 struct TuiEventSink {
@@ -2118,7 +2648,7 @@ struct TuiEventSink {
 impl EngineEventSink for TuiEventSink {
     fn on_event(&mut self, event: &zetta_protocol::EngineEvent) -> Result<()> {
         let mut runtime = self.runtime.lock().expect("tui runtime");
-        runtime.push_event_line(render_engine_event_line(event));
+        runtime.push_activity_entry(activity_entry_from_event(event));
         if matches!(
             event,
             zetta_protocol::EngineEvent::AssistantMessagePersisted { .. }
@@ -2149,246 +2679,72 @@ impl ModelStreamSink for TuiModelStreamSink {
     }
 }
 
-fn tui_transcript_lines(state: &TuiState) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    if let Some(session) = &state.session {
-        for message in &session.messages {
-            let role = match message.role {
-                zetta_protocol::MessageRole::System => "system",
-                zetta_protocol::MessageRole::User => "user",
-                zetta_protocol::MessageRole::Assistant => "assistant",
-                zetta_protocol::MessageRole::Tool => "tool",
-            };
-            let content = if matches!(message.role, zetta_protocol::MessageRole::Tool) {
-                summarize_tool_result(&message.content)
-            } else {
-                message.content.clone()
-            };
-            lines.push(format!("[{role}]"));
-            lines.extend(content.lines().map(ToString::to_string));
-            lines.push(String::new());
-        }
-    } else {
-        lines.push("<empty session>".to_string());
-    }
-
-    if !state.pending_assistant.is_empty() {
-        lines.push("[assistant/stream]".to_string());
-        lines.extend(state.pending_assistant.lines().map(ToString::to_string));
-    }
-
-    lines
-}
-
-fn tui_status_lines(state: &TuiState) -> Vec<String> {
-    let mut lines = vec![
-        format!("session: {}", state.session_id),
-        format!(
-            "provider: {}",
-            state.active_provider.as_deref().unwrap_or("<none>")
-        ),
-        format!(
-            "mode: {}",
-            state
-                .permission_mode
-                .unwrap_or(CliPermissionMode::WorkspaceWrite)
-                .as_str()
-        ),
-        format!("state: {}", if state.busy { "running" } else { "idle" }),
-    ];
-
-    if let Some(session) = &state.session {
-        let overview = build_session_overview(session);
-        lines.push(format!("turns: {}", overview.user_turns));
-        lines.push(format!("messages: {}", session.messages.len()));
-        lines.push(format!(
-            "tools: ok={} deny={} fail={}",
-            overview.completed_tools, overview.denied_tools, overview.failed_tools
-        ));
-    }
-
-    if let Some(error) = &state.last_error {
-        lines.push(String::new());
-        lines.push("error:".to_string());
-        lines.push(error.clone());
-    }
-
-    lines.push(String::new());
-    lines.push("recent:".to_string());
-    lines.extend(
-        state
-            .event_lines
-            .iter()
-            .rev()
-            .take(12)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    lines
-}
-
-fn tui_input_lines(state: &TuiState) -> Vec<String> {
-    if state.input.is_empty() {
-        vec!["Type a prompt and press Enter. Esc exits.".to_string()]
-    } else {
-        state.input.lines().map(ToString::to_string).collect()
-    }
-}
-
-fn draw_box(
-    stdout: &mut io::Stdout,
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
-    title: &str,
-    lines: &[String],
-) -> Result<()> {
-    if width < 4 || height < 3 {
-        return Ok(());
-    }
-
-    let inner_width = width.saturating_sub(2) as usize;
-    let horizontal = "─".repeat(inner_width);
-    queue!(stdout, MoveTo(x, y), Print(format!("┌{horizontal}┐")))?;
-
-    let title_text = format!(" {title} ");
-    let title_len = title_text.chars().count().min(inner_width);
-    queue!(
-        stdout,
-        MoveTo(x + 1, y),
-        Print(title_text.chars().take(title_len).collect::<String>())
-    )?;
-
-    let wrapped = wrap_lines(lines, inner_width);
-    let visible_capacity = height.saturating_sub(2) as usize;
-    let visible_start = wrapped.len().saturating_sub(visible_capacity);
-    let visible = &wrapped[visible_start..];
-
-    for row in 0..height.saturating_sub(2) {
-        let content = visible
-            .get(row as usize)
-            .map(String::as_str)
-            .unwrap_or_default();
-        let padded = pad_to_width(content, inner_width);
-        queue!(
-            stdout,
-            MoveTo(x, y + 1 + row),
-            Print("│"),
-            Print(padded),
-            Print("│")
-        )?;
-    }
-
-    queue!(
-        stdout,
-        MoveTo(x, y + height - 1),
-        Print(format!("└{}┘", "─".repeat(inner_width)))
-    )?;
-    Ok(())
-}
-
-fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
-    let mut wrapped = Vec::new();
-
-    for line in lines {
-        if line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        for ch in line.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if current_width + ch_width > width && !current.is_empty() {
-                wrapped.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += ch_width;
-            if current_width >= width && !current.is_empty() {
-                wrapped.push(current);
-                current = String::new();
-                current_width = 0;
-            }
-        }
-        if current.is_empty() {
-            continue;
-        }
-        wrapped.push(current);
-    }
-
-    wrapped
-}
-
-fn pad_to_width(input: &str, width: usize) -> String {
-    let mut padded = String::new();
-    let mut used = 0usize;
-
-    for ch in input.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + ch_width > width {
-            break;
-        }
-        padded.push(ch);
-        used += ch_width;
-    }
-
-    if used < width {
-        padded.push_str(&" ".repeat(width - used));
-    }
-    padded
-}
-
 fn display_width(input: &str) -> usize {
     UnicodeWidthStr::width(input)
 }
 
-fn render_engine_event_line(event: &zetta_protocol::EngineEvent) -> String {
+fn activity_entry_from_event(event: &zetta_protocol::EngineEvent) -> TuiActivityEntry {
     match event {
-        zetta_protocol::EngineEvent::SessionLoaded { session_id, is_new } => {
-            format!(
-                "[turn] session={} state={}",
+        zetta_protocol::EngineEvent::SessionLoaded { session_id, is_new } => TuiActivityEntry {
+            badge: "turn".to_string(),
+            title: format!(
+                "session={} state={}",
                 session_id,
                 if *is_new { "new" } else { "resume" }
-            )
-        }
-        zetta_protocol::EngineEvent::UserMessagePersisted { .. } => {
-            "[turn] user message persisted".to_string()
-        }
-        zetta_protocol::EngineEvent::ToolCallRequested { call } => {
-            format!(
-                "[tool] request {} {}",
+            ),
+            detail: None,
+            tone: ActivityTone::Neutral,
+        },
+        zetta_protocol::EngineEvent::UserMessagePersisted { .. } => TuiActivityEntry {
+            badge: "turn".to_string(),
+            title: "user message persisted".to_string(),
+            detail: None,
+            tone: ActivityTone::Neutral,
+        },
+        zetta_protocol::EngineEvent::ToolCallRequested { call } => TuiActivityEntry {
+            badge: "tool".to_string(),
+            title: format!(
+                "request {} {}",
                 call.name,
-                summarize_json_inline(&call.input, 56)
-            )
-        }
-        zetta_protocol::EngineEvent::ToolCallDenied { call, reason } => {
-            format!("[tool] denied {}: {reason}", call.name)
-        }
-        zetta_protocol::EngineEvent::ToolCallFailed { call, error } => {
-            format!("[tool] failed {}: {error}", call.name)
-        }
-        zetta_protocol::EngineEvent::ToolCallCompleted { result } => {
-            format!(
-                "[tool] done {} {}",
+                summarize_json_inline(&call.input, 72)
+            ),
+            detail: None,
+            tone: ActivityTone::Running,
+        },
+        zetta_protocol::EngineEvent::ToolCallDenied { call, reason } => TuiActivityEntry {
+            badge: "tool".to_string(),
+            title: format!("denied {}: {}", call.name, reason),
+            detail: None,
+            tone: ActivityTone::Warning,
+        },
+        zetta_protocol::EngineEvent::ToolCallFailed { call, error } => TuiActivityEntry {
+            badge: "tool".to_string(),
+            title: format!("failed {}: {}", call.name, error),
+            detail: None,
+            tone: ActivityTone::Error,
+        },
+        zetta_protocol::EngineEvent::ToolCallCompleted { result } => TuiActivityEntry {
+            badge: "tool".to_string(),
+            title: format!(
+                "done {} {}",
                 result.name,
-                summarize_json_inline(&result.output, 56)
-            )
-        }
-        zetta_protocol::EngineEvent::AssistantMessagePersisted { message } => {
-            format!(
-                "[assistant] {}",
-                summarize_history_content(&message.content)
-            )
-        }
-        zetta_protocol::EngineEvent::TurnFinished { session_id } => {
-            format!("[summary] session={session_id} finished")
-        }
+                summarize_json_inline(&result.output, 72)
+            ),
+            detail: None,
+            tone: ActivityTone::Success,
+        },
+        zetta_protocol::EngineEvent::AssistantMessagePersisted { message } => TuiActivityEntry {
+            badge: "assistant".to_string(),
+            title: summarize_history_content(&message.content),
+            detail: None,
+            tone: ActivityTone::Assistant,
+        },
+        zetta_protocol::EngineEvent::TurnFinished { session_id } => TuiActivityEntry {
+            badge: "summary".to_string(),
+            title: format!("session={session_id} finished"),
+            detail: None,
+            tone: ActivityTone::Success,
+        },
     }
 }
 
@@ -3245,10 +3601,10 @@ mod tests {
 
     use super::{
         build_session_overview, default_openai_system_prompt, display_width,
-        latest_assistant_message, pad_to_width, parse_repl_command, render_cli_error_lines,
-        render_repl_prompt, resolve_openai_options, search_session_messages,
-        summarize_history_content, trim_session_to_last_user_turns, user_turn_from_end, wrap_lines,
-        ReplCommand, ResolvedOpenAiCompatibleOptions,
+        latest_assistant_message, parse_repl_command, render_cli_error_lines, render_repl_prompt,
+        resolve_openai_options, search_session_messages, split_text_lines,
+        summarize_history_content, trim_session_to_last_user_turns, user_turn_from_end,
+        wrap_plain_lines, ReplCommand, ResolvedOpenAiCompatibleOptions,
     };
 
     #[test]
@@ -3327,10 +3683,13 @@ mod tests {
     fn tui_line_helpers_measure_wide_characters_by_display_width() {
         assert_eq!(display_width("仓库"), 4);
         assert_eq!(
-            wrap_lines(&[String::from("仓库结构")], 4),
+            wrap_plain_lines(&[String::from("仓库结构")], 4),
             vec!["仓库", "结构"]
         );
-        assert_eq!(pad_to_width("仓库", 6), "仓库  ");
+        assert_eq!(
+            split_text_lines("line one\nline two\n"),
+            vec!["line one", "line two", ""]
+        );
     }
 
     #[test]

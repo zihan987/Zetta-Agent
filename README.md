@@ -180,11 +180,15 @@ Start it from a real terminal:
 
 ```bash
 cargo run -p zetta-cli -- tui
+cargo run -p zetta-cli -- --provider deepseek tui
 ```
 
 Controls:
 
 - `Enter`: submit the current prompt
+- `Ctrl+J`: insert a newline in the composer
+- `Up` / `Down`: scroll the conversation pane
+- `Shift+Up` / `Shift+Down`: scroll the activity pane
 - `Esc` or `Ctrl+C`: exit the TUI
 - `Ctrl+N`: switch to a new session
 - `Ctrl+U`: clear the current input buffer
@@ -192,6 +196,7 @@ Controls:
 - `F1`: print the control summary into the status pane
 
 The TUI requires an interactive terminal (TTY). It is not meant to run through a non-interactive pipe.
+If no provider is selected, the TUI runs with the local placeholder model and shows `provider: placeholder` in the header.
 
 ### OpenAI-Compatible Providers
 

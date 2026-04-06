@@ -45,7 +45,20 @@ Start the full-screen TUI:
 
 ```bash
 cargo run -p zetta-cli -- tui
+cargo run -p zetta-cli -- --provider deepseek tui
 ```
+
+TUI controls:
+
+- `Enter` sends the prompt
+- `Ctrl+J` inserts a newline
+- `Up` / `Down` scroll the conversation pane
+- `Shift+Up` / `Shift+Down` scroll the activity pane
+- `Ctrl+N` starts a new session
+- `Ctrl+U` clears the composer
+- `Ctrl+L` redraws the screen
+- `Esc` or `Ctrl+C` exits
+- `F1` appends the key summary into the activity pane
 
 Local REPL commands:
 

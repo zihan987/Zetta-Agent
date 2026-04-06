@@ -45,7 +45,20 @@ cargo run -p zetta-cli -- repl
 
 ```bash
 cargo run -p zetta-cli -- tui
+cargo run -p zetta-cli -- --provider deepseek tui
 ```
+
+TUI 快捷键：
+
+- `Enter` 发送当前输入
+- `Ctrl+J` 插入换行
+- `Up` / `Down` 滚动左侧会话区
+- `Shift+Up` / `Shift+Down` 滚动右侧活动区
+- `Ctrl+N` 新建 session
+- `Ctrl+U` 清空输入框
+- `Ctrl+L` 强制重绘
+- `Esc` 或 `Ctrl+C` 退出
+- `F1` 把快捷键说明追加到右侧活动区
 
 REPL 内置本地命令：
 
