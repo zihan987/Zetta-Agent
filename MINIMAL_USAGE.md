@@ -50,15 +50,16 @@ cargo run -p zetta-cli -- --provider deepseek tui
 
 TUI controls:
 
-- `Enter` sends the prompt
-- `Ctrl+J` inserts a newline
-- `Up` / `Down` scroll the conversation pane
-- `Shift+Up` / `Shift+Down` scroll the activity pane
+- `Tab` / `Shift+Tab` switches focus between panes
+- `Enter` sends the prompt when the prompt pane is focused
+- `Shift+Enter` inserts a newline
+- `Alt+P` / `Alt+N` recalls earlier prompts
+- `Up` / `Down` scrolls the currently focused pane
+- `?` or `F1` opens the in-app help overlay
 - `Ctrl+N` starts a new session
 - `Ctrl+U` clears the composer
 - `Ctrl+L` redraws the screen
 - `Esc` or `Ctrl+C` exits
-- `F1` appends the key summary into the activity pane
 
 Local REPL commands:
 

@@ -54,7 +54,6 @@ const PROJECT_CONFIG_DIRNAME: &str = ".zetta";
 const PROJECT_PERMISSION_CONFIG_FILENAME: &str = "project-permissions.json";
 const PROJECT_HOOK_CONFIG_FILENAME: &str = "project-hooks.json";
 const TUI_COMPOSER_HEIGHT: u16 = 8;
-const TUI_FOOTER_HEIGHT: u16 = 1;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -1183,14 +1182,18 @@ async fn run_tui(
             session_id,
             active_provider: cli.provider.clone(),
             permission_mode: cli.permission_mode,
+            focus: TuiFocus::Prompt,
+            help_overlay: false,
             input: String::new(),
+            input_history: tui_input_history_from_session(session.as_ref()),
+            input_history_index: None,
+            input_history_draft: None,
             pending_assistant: String::new(),
             activity_entries: vec![TuiActivityEntry {
                 badge: "HELP".to_string(),
-                title: "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity"
-                    .to_string(),
+                title: "Tab focus • ? help • Enter submit • Shift+Enter newline".to_string(),
                 detail: Some(
-                    "Esc exit • Ctrl+N new session • Ctrl+L redraw • Ctrl+U clear input"
+                    "Focus a pane, then use ↑/↓ to scroll • Alt+P/N recalls prompt history"
                         .to_string(),
                 ),
                 tone: ActivityTone::Neutral,
@@ -1252,10 +1255,12 @@ async fn run_tui_turn(
     let (session_id, active_provider, permission_mode, prompt) = {
         let mut runtime = runtime.lock().expect("tui runtime");
         let prompt = runtime.state.input.trim().to_string();
+        runtime.record_input_history(&prompt);
         runtime.state.input.clear();
         runtime.state.pending_assistant.clear();
         runtime.state.last_error = None;
         runtime.state.busy = true;
+        runtime.clear_history_navigation();
         runtime.push_event_line(format!("[submit] {}", summarize_history_content(&prompt)));
         runtime.render()?;
         (
@@ -1338,6 +1343,25 @@ enum TuiAction {
 fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiAction> {
     let mut runtime = runtime.lock().expect("tui runtime");
 
+    if runtime.state.help_overlay {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => {
+                runtime.state.help_overlay = false;
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            KeyCode::Tab => {
+                runtime.cycle_focus(key.modifiers.contains(KeyModifiers::SHIFT));
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            _ => {
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+        }
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') => return Ok(TuiAction::Exit),
@@ -1352,12 +1376,17 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
             }
             KeyCode::Char('u') => {
                 runtime.state.input.clear();
+                runtime.clear_history_navigation();
                 runtime.render()?;
                 return Ok(TuiAction::None);
             }
             KeyCode::Char('n') => {
                 runtime.state.session_id = SessionId::new();
                 runtime.state.session = None;
+                runtime.state.focus = TuiFocus::Prompt;
+                runtime.state.input_history.clear();
+                runtime.state.input_history_index = None;
+                runtime.state.input_history_draft = None;
                 runtime.state.pending_assistant.clear();
                 runtime.reset_scrolls();
                 let session_id = runtime.state.session_id;
@@ -1369,37 +1398,65 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
         }
     }
 
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('p') => {
+                if runtime.state.focus == TuiFocus::Prompt {
+                    runtime.history_previous();
+                }
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            KeyCode::Char('n') => {
+                if runtime.state.focus == TuiFocus::Prompt {
+                    runtime.history_next();
+                }
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc => return Ok(TuiAction::Exit),
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            runtime.scroll_activity(8);
+        KeyCode::BackTab => {
+            runtime.cycle_focus(true);
         }
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            runtime.scroll_activity(-8);
+        KeyCode::Tab if key.modifiers.is_empty() => {
+            runtime.cycle_focus(false);
         }
-        KeyCode::Up if key.modifiers.is_empty() => {
-            runtime.scroll_transcript(8);
+        KeyCode::Char('?')
+            if key.modifiers.is_empty()
+                && (runtime.state.focus != TuiFocus::Prompt || runtime.state.input.is_empty()) =>
+        {
+            runtime.state.help_overlay = true;
         }
-        KeyCode::Down if key.modifiers.is_empty() => {
-            runtime.scroll_transcript(-8);
+        KeyCode::Up if key.modifiers.is_empty() && runtime.state.focus != TuiFocus::Prompt => {
+            runtime.scroll_current_focus(8);
+        }
+        KeyCode::Down if key.modifiers.is_empty() && runtime.state.focus != TuiFocus::Prompt => {
+            runtime.scroll_current_focus(-8);
         }
         KeyCode::F(1) => {
-            runtime.push_activity_entry(TuiActivityEntry {
-                badge: "HELP".to_string(),
-                title: "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity"
-                    .to_string(),
-                detail: Some(
-                    "Esc exit • Ctrl+N new session • Ctrl+U clear input • Ctrl+L redraw"
-                        .to_string(),
-                ),
-                tone: ActivityTone::Neutral,
-            });
+            runtime.state.help_overlay = true;
         }
         KeyCode::Backspace => {
-            runtime.state.input.pop();
+            if runtime.state.focus == TuiFocus::Prompt && !runtime.state.busy {
+                runtime.state.input.pop();
+                runtime.clear_history_navigation();
+            }
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if runtime.state.focus == TuiFocus::Prompt && !runtime.state.busy {
+                runtime.state.input.push('\n');
+                runtime.clear_history_navigation();
+            }
         }
         KeyCode::Enter => {
-            let should_submit = !runtime.state.busy && !runtime.state.input.trim().is_empty();
+            let should_submit = runtime.state.focus == TuiFocus::Prompt
+                && !runtime.state.busy
+                && !runtime.state.input.trim().is_empty();
             runtime.render()?;
             return Ok(if should_submit {
                 TuiAction::Submit
@@ -1407,10 +1464,19 @@ fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiA
                 TuiAction::None
             });
         }
-        KeyCode::Tab => runtime.state.input.push_str("    "),
+        KeyCode::Tab => {
+            if runtime.state.focus == TuiFocus::Prompt && !runtime.state.busy {
+                runtime.state.input.push_str("    ");
+                runtime.clear_history_navigation();
+            }
+        }
         KeyCode::Char(character) => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            if runtime.state.focus == TuiFocus::Prompt
+                && !runtime.state.busy
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
                 runtime.state.input.push(character);
+                runtime.clear_history_navigation();
             }
         }
         _ => {}
@@ -2058,7 +2124,12 @@ struct TuiState {
     session_id: SessionId,
     active_provider: Option<String>,
     permission_mode: Option<CliPermissionMode>,
+    focus: TuiFocus,
+    help_overlay: bool,
     input: String,
+    input_history: Vec<String>,
+    input_history_index: Option<usize>,
+    input_history_draft: Option<String>,
     pending_assistant: String,
     activity_entries: Vec<TuiActivityEntry>,
     last_error: Option<String>,
@@ -2066,6 +2137,13 @@ struct TuiState {
     session: Option<zetta_protocol::SessionSnapshot>,
     transcript_scroll: usize,
     activity_scroll: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiFocus {
+    Conversation,
+    Activity,
+    Prompt,
 }
 
 #[derive(Clone, Debug)]
@@ -2142,6 +2220,17 @@ impl TuiRuntime {
         Self { state, terminal }
     }
 
+    fn cycle_focus(&mut self, reverse: bool) {
+        self.state.focus = match (self.state.focus, reverse) {
+            (TuiFocus::Conversation, false) => TuiFocus::Activity,
+            (TuiFocus::Activity, false) => TuiFocus::Prompt,
+            (TuiFocus::Prompt, false) => TuiFocus::Conversation,
+            (TuiFocus::Conversation, true) => TuiFocus::Prompt,
+            (TuiFocus::Activity, true) => TuiFocus::Conversation,
+            (TuiFocus::Prompt, true) => TuiFocus::Activity,
+        };
+    }
+
     fn push_activity_entry(&mut self, entry: TuiActivityEntry) {
         self.state.activity_entries.push(entry);
         const MAX_ACTIVITY_ENTRIES: usize = 200;
@@ -2158,6 +2247,77 @@ impl TuiRuntime {
             detail: None,
             tone: ActivityTone::Neutral,
         });
+    }
+
+    fn record_input_history(&mut self, input: &str) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if self
+            .state
+            .input_history
+            .last()
+            .is_some_and(|last| last == trimmed)
+        {
+            self.state.input_history_index = None;
+            self.state.input_history_draft = None;
+            return;
+        }
+
+        self.state.input_history.push(trimmed.to_string());
+        const MAX_INPUT_HISTORY: usize = 100;
+        if self.state.input_history.len() > MAX_INPUT_HISTORY {
+            let trim = self.state.input_history.len() - MAX_INPUT_HISTORY;
+            self.state.input_history.drain(0..trim);
+        }
+        self.state.input_history_index = None;
+        self.state.input_history_draft = None;
+    }
+
+    fn history_previous(&mut self) {
+        if self.state.input_history.is_empty() {
+            return;
+        }
+
+        let next_index = match self.state.input_history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.state.input_history_draft = Some(self.state.input.clone());
+                self.state.input_history.len().saturating_sub(1)
+            }
+        };
+        self.state.input_history_index = Some(next_index);
+        self.state.input = self.state.input_history[next_index].clone();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.state.input_history_index else {
+            return;
+        };
+
+        if index + 1 < self.state.input_history.len() {
+            let next_index = index + 1;
+            self.state.input_history_index = Some(next_index);
+            self.state.input = self.state.input_history[next_index].clone();
+        } else {
+            self.state.input_history_index = None;
+            self.state.input = self.state.input_history_draft.take().unwrap_or_default();
+        }
+    }
+
+    fn clear_history_navigation(&mut self) {
+        self.state.input_history_index = None;
+        self.state.input_history_draft = None;
+    }
+
+    fn scroll_current_focus(&mut self, delta: isize) {
+        match self.state.focus {
+            TuiFocus::Conversation => self.scroll_transcript(delta),
+            TuiFocus::Activity => self.scroll_activity(delta),
+            TuiFocus::Prompt => {}
+        }
     }
 
     fn scroll_transcript(&mut self, delta: isize) {
@@ -2188,17 +2348,37 @@ fn apply_scroll_delta(current: usize, delta: isize) -> usize {
     }
 }
 
+fn tui_input_history_from_session(
+    session: Option<&zetta_protocol::SessionSnapshot>,
+) -> Vec<String> {
+    session
+        .into_iter()
+        .flat_map(|session| session.messages.iter())
+        .filter(|message| matches!(message.role, zetta_protocol::MessageRole::User))
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn pane_title(base: &str, scroll: usize) -> String {
     let _ = scroll;
     format!(" {base} ")
 }
 
-fn panel_block(title: String, color: Color) -> Block<'static> {
+fn panel_block(title: String, color: Color, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title, Style::default().fg(color)))
+        .border_style(Style::default().fg(if focused { color } else { Color::DarkGray }))
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ))
 }
 
 fn subtle_text(color: Color) -> Style {
@@ -2217,19 +2397,19 @@ fn transcript_role_style(role: zetta_protocol::MessageRole) -> (Style, Style) {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::Rgb(228, 232, 238)),
         ),
         zetta_protocol::MessageRole::Assistant => (
             Style::default()
-                .fg(Color::White)
+                .fg(Color::LightBlue)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::White),
         ),
         zetta_protocol::MessageRole::Tool => (
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-            subtle_text(Color::Gray),
+            subtle_text(Color::DarkGray),
         ),
     }
 }
@@ -2242,7 +2422,6 @@ fn render_tui_frame(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
             Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(TUI_COMPOSER_HEIGHT),
-            Constraint::Length(TUI_FOOTER_HEIGHT),
         ])
         .split(area);
 
@@ -2252,12 +2431,12 @@ fn render_tui_frame(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let body_chunks = if body.width >= 96 {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(40), Constraint::Length(36)])
+            .constraints([Constraint::Min(48), Constraint::Length(32)])
             .split(body)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(13)])
+            .constraints([Constraint::Min(10), Constraint::Length(11)])
             .split(body)
     };
 
@@ -2265,14 +2444,17 @@ fn render_tui_frame(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     let side_area = body_chunks[1];
     let side_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(4)])
+        .constraints([Constraint::Length(7), Constraint::Min(4)])
         .split(side_area);
 
     render_transcript_pane(frame, transcript_area, state);
     render_overview_pane(frame, side_chunks[0], state);
     render_activity_pane(frame, side_chunks[1], state);
     render_composer_pane(frame, vertical[2], state);
-    render_footer(frame, vertical[3], state);
+
+    if state.help_overlay {
+        render_help_overlay(frame, area);
+    }
 }
 
 fn render_tui_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
@@ -2318,6 +2500,17 @@ fn render_tui_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiStat
         Span::raw(" "),
         Span::styled(session_short, Style::default().fg(Color::LightYellow)),
         Span::raw("   "),
+        Span::styled("focus", subtle_text(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(
+            match state.focus {
+                TuiFocus::Conversation => "conversation",
+                TuiFocus::Activity => "activity",
+                TuiFocus::Prompt => "prompt",
+            },
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw("   "),
         Span::styled(state_label, state_style),
     ]);
 
@@ -2332,6 +2525,7 @@ fn render_transcript_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Tu
         } else {
             Color::Gray
         },
+        state.focus == TuiFocus::Conversation,
     );
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -2341,7 +2535,7 @@ fn render_transcript_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Tu
 }
 
 fn render_overview_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let block = panel_block(" Overview ".to_string(), Color::Gray);
+    let block = panel_block(" Overview ".to_string(), Color::Gray, false);
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
     let wrapped = wrap_styled_lines(&tui_overview_lines(state), inner_width.max(1));
@@ -2350,7 +2544,11 @@ fn render_overview_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiS
 }
 
 fn render_activity_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let block = panel_block(pane_title("Activity", state.activity_scroll), Color::Gray);
+    let block = panel_block(
+        pane_title("Activity", state.activity_scroll),
+        Color::Gray,
+        state.focus == TuiFocus::Activity,
+    );
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
     let wrapped = wrap_styled_lines(&tui_activity_lines(state), inner_width.max(1));
@@ -2358,11 +2556,71 @@ fn render_activity_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiS
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let overlay = centered_rect(area, 72, 12);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Gray))
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Tab / Shift+Tab    switch focus between Conversation, Activity, and Prompt",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "Up / Down          scroll the focused pane when Conversation or Activity is active",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Enter              submit the current prompt when Prompt is focused",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "Shift+Enter        insert a newline in the Prompt composer",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Alt+P / Alt+N      cycle through prior submitted prompts in Prompt focus",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "Ctrl+N / Ctrl+U    new session / clear prompt",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "? / F1 / Esc       open, close, or dismiss this help overlay",
+            Style::default().fg(Color::White),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let overlay_width = width.min(area.width.saturating_sub(2)).max(10);
+    let overlay_height = height.min(area.height.saturating_sub(2)).max(6);
+    let x = area
+        .x
+        .saturating_add(area.width.saturating_sub(overlay_width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(overlay_height) / 2);
+    Rect::new(x, y, overlay_width, overlay_height)
+}
+
 fn render_composer_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     let title = if state.busy {
-        " Composer • sending "
+        " Prompt • sending "
     } else {
-        " Composer "
+        " Prompt "
     };
     let block = panel_block(
         title.to_string(),
@@ -2371,40 +2629,51 @@ fn render_composer_pane(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiS
         } else {
             Color::Gray
         },
+        state.focus == TuiFocus::Prompt,
     );
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let input_area = sections[0];
+    let hint_area = sections[1];
+    let inner_width = input_area.width as usize;
+    let inner_height = input_area.height as usize;
     let (lines, cursor_line, cursor_col) =
         composer_display_lines(state, inner_width.max(1), inner_height.max(1));
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), input_area);
 
-    if !state.busy {
-        frame.set_cursor_position((
-            area.x
-                .saturating_add(1)
-                .saturating_add(cursor_col as u16)
-                .min(area.x.saturating_add(area.width.saturating_sub(2))),
-            area.y
-                .saturating_add(1)
-                .saturating_add(cursor_line as u16)
-                .min(area.y.saturating_add(area.height.saturating_sub(2))),
-        ));
-    }
-}
-
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let provider_hint = if state.active_provider.is_none() {
-        "No provider configured: using local placeholder model. Launch with --provider <name> for a real model."
+    let composer_hint = if state.active_provider.is_none() {
+        "Tab focus • ? help • Enter submit • Shift+Enter newline • placeholder model"
     } else {
-        "Enter submit • Ctrl+J newline • ↑/↓ conversation • Shift+↑/↓ activity • Ctrl+N new session • Esc exit"
+        "Tab focus • ? help • Enter submit • Shift+Enter newline • Alt+P/N history"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            provider_hint,
+            composer_hint,
             subtle_text(Color::DarkGray),
         ))),
-        area,
+        hint_area,
     );
+
+    if !state.busy {
+        frame.set_cursor_position((
+            input_area.x.saturating_add(cursor_col as u16).min(
+                input_area
+                    .x
+                    .saturating_add(input_area.width.saturating_sub(1)),
+            ),
+            input_area.y.saturating_add(cursor_line as u16).min(
+                input_area
+                    .y
+                    .saturating_add(input_area.height.saturating_sub(1)),
+            ),
+        ));
+    }
 }
 
 fn tui_transcript_lines(state: &TuiState) -> Vec<StyledTextLine> {
@@ -2413,20 +2682,23 @@ fn tui_transcript_lines(state: &TuiState) -> Vec<StyledTextLine> {
     if let Some(session) = &state.session {
         for message in &session.messages {
             let (header_style, body_style) = transcript_role_style(message.role.clone());
-            let label = match message.role {
-                zetta_protocol::MessageRole::System => "SYSTEM",
-                zetta_protocol::MessageRole::User => "USER",
-                zetta_protocol::MessageRole::Assistant => "ASSISTANT",
-                zetta_protocol::MessageRole::Tool => "TOOL",
+            let (label, prefix) = match message.role {
+                zetta_protocol::MessageRole::System => ("System", "·"),
+                zetta_protocol::MessageRole::User => ("You", ">"),
+                zetta_protocol::MessageRole::Assistant => ("Zetta", "›"),
+                zetta_protocol::MessageRole::Tool => ("Tool", "·"),
             };
             let content = if matches!(message.role, zetta_protocol::MessageRole::Tool) {
                 summarize_tool_result(&message.content)
             } else {
                 message.content.clone()
             };
-            lines.push(StyledTextLine::styled(format!("{label}"), header_style));
+            lines.push(StyledTextLine::styled(
+                format!("{prefix} {label}"),
+                header_style,
+            ));
             for line in content.lines() {
-                lines.push(StyledTextLine::styled(line.to_string(), body_style));
+                lines.push(StyledTextLine::styled(format!("  {line}"), body_style));
             }
             lines.push(StyledTextLine::plain(String::new()));
         }
@@ -2439,15 +2711,15 @@ fn tui_transcript_lines(state: &TuiState) -> Vec<StyledTextLine> {
 
     if !state.pending_assistant.is_empty() {
         lines.push(StyledTextLine::styled(
-            "ASSISTANT • streaming",
+            "› Zetta",
             Style::default()
                 .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         ));
         for line in state.pending_assistant.lines() {
             lines.push(StyledTextLine::styled(
-                line.to_string(),
-                Style::default().fg(Color::Rgb(220, 232, 228)),
+                format!("  {line}"),
+                Style::default().fg(Color::White),
             ));
         }
     }
@@ -2482,6 +2754,19 @@ fn tui_overview_lines(state: &TuiState) -> Vec<StyledTextLine> {
                 overview.completed_tools, overview.denied_tools, overview.failed_tools
             ),
         ));
+    }
+
+    if state.busy {
+        if let Some(entry) = state
+            .activity_entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.tone, ActivityTone::Running))
+        {
+            lines.push(kv_line("active", &entry.title));
+        } else {
+            lines.push(kv_line("active", "planning"));
+        }
     }
 
     if state.active_provider.is_none() {
@@ -2519,9 +2804,57 @@ fn tui_activity_lines(state: &TuiState) -> Vec<StyledTextLine> {
         return lines;
     }
 
-    for entry in state.activity_entries.iter().rev().take(80).rev() {
+    let entries = state
+        .activity_entries
+        .iter()
+        .rev()
+        .take(24)
+        .collect::<Vec<_>>();
+    let current_index = entries
+        .iter()
+        .position(|entry| matches!(entry.tone, ActivityTone::Running));
+
+    if let Some(index) = current_index {
+        let entry = entries[index];
         lines.push(StyledTextLine::styled(
-            format!("[{}] {}", entry.badge.to_lowercase(), entry.title),
+            "Current",
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(StyledTextLine::styled(
+            format!("› [{}] {}", entry.badge.to_lowercase(), entry.title),
+            entry.tone.title_style(),
+        ));
+        if let Some(detail) = &entry.detail {
+            lines.push(StyledTextLine::styled(
+                format!("  {}", detail),
+                entry.tone.detail_style(),
+            ));
+        }
+        lines.push(StyledTextLine::plain(String::new()));
+    }
+
+    let mut recent = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (Some(index) != current_index).then_some(*entry))
+        .take(12)
+        .collect::<Vec<_>>();
+
+    if !recent.is_empty() {
+        lines.push(StyledTextLine::styled(
+            "Recent",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    recent.reverse();
+    for entry in recent {
+        lines.push(StyledTextLine::styled(
+            format!("· [{}] {}", entry.badge.to_lowercase(), entry.title),
             entry.tone.title_style(),
         ));
         if let Some(detail) = &entry.detail {
@@ -2540,12 +2873,40 @@ fn composer_display_lines(
     width: usize,
     height: usize,
 ) -> (Vec<Line<'static>>, usize, usize) {
-    if state.input.is_empty() {
+    if state.busy {
         return (
-            vec![Line::from(Span::styled(
-                "Type a prompt. Enter sends, Ctrl+J adds a new line.",
-                Style::default().fg(Color::DarkGray),
-            ))],
+            vec![
+                Line::from(Span::styled(
+                    "Zetta is working on the current turn.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "Prompt editing is locked until the turn finishes.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+            0,
+            0,
+        );
+    }
+
+    if state.input.is_empty() {
+        let provider = state.active_provider.as_deref().unwrap_or("placeholder");
+        let mode = state
+            .permission_mode
+            .unwrap_or(CliPermissionMode::WorkspaceWrite)
+            .as_str();
+        return (
+            vec![
+                Line::from(Span::styled(
+                    format!("Ask Zetta about this workspace. Provider: {provider} • Mode: {mode}"),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "Tab focuses panes • Enter sends • Shift+Enter newline • Alt+P/N recalls prior prompts",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
             0,
             0,
         );
@@ -2703,34 +3064,26 @@ fn activity_entry_from_event(event: &zetta_protocol::EngineEvent) -> TuiActivity
         },
         zetta_protocol::EngineEvent::ToolCallRequested { call } => TuiActivityEntry {
             badge: "tool".to_string(),
-            title: format!(
-                "request {} {}",
-                call.name,
-                summarize_json_inline(&call.input, 72)
-            ),
-            detail: None,
+            title: format!("request {}", call.name),
+            detail: Some(summarize_json_inline(&call.input, 72)),
             tone: ActivityTone::Running,
         },
         zetta_protocol::EngineEvent::ToolCallDenied { call, reason } => TuiActivityEntry {
             badge: "tool".to_string(),
-            title: format!("denied {}: {}", call.name, reason),
-            detail: None,
+            title: format!("denied {}", call.name),
+            detail: Some(reason.clone()),
             tone: ActivityTone::Warning,
         },
         zetta_protocol::EngineEvent::ToolCallFailed { call, error } => TuiActivityEntry {
             badge: "tool".to_string(),
-            title: format!("failed {}: {}", call.name, error),
-            detail: None,
+            title: format!("failed {}", call.name),
+            detail: Some(error.clone()),
             tone: ActivityTone::Error,
         },
         zetta_protocol::EngineEvent::ToolCallCompleted { result } => TuiActivityEntry {
             badge: "tool".to_string(),
-            title: format!(
-                "done {} {}",
-                result.name,
-                summarize_json_inline(&result.output, 72)
-            ),
-            detail: None,
+            title: format!("done {}", result.name),
+            detail: Some(summarize_json_inline(&result.output, 72)),
             tone: ActivityTone::Success,
         },
         zetta_protocol::EngineEvent::AssistantMessagePersisted { message } => TuiActivityEntry {
@@ -3603,8 +3956,8 @@ mod tests {
         build_session_overview, default_openai_system_prompt, display_width,
         latest_assistant_message, parse_repl_command, render_cli_error_lines, render_repl_prompt,
         resolve_openai_options, search_session_messages, split_text_lines,
-        summarize_history_content, trim_session_to_last_user_turns, user_turn_from_end,
-        wrap_plain_lines, ReplCommand, ResolvedOpenAiCompatibleOptions,
+        summarize_history_content, trim_session_to_last_user_turns, tui_input_history_from_session,
+        user_turn_from_end, wrap_plain_lines, ReplCommand, ResolvedOpenAiCompatibleOptions,
     };
 
     #[test]
@@ -3998,6 +4351,34 @@ mod tests {
         );
 
         assert_eq!(prompt, "zetta[11111111 ro deepseek]> ");
+    }
+
+    #[test]
+    fn tui_history_seed_uses_non_empty_user_messages() {
+        let mut session = zetta_protocol::SessionSnapshot::new(SessionId::new());
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::System,
+            "system",
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::User,
+            " first prompt ",
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::Assistant,
+            "reply",
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::User,
+            "",
+        ));
+        session.messages.push(zetta_protocol::Message::new(
+            zetta_protocol::MessageRole::User,
+            "second prompt",
+        ));
+
+        let history = tui_input_history_from_session(Some(&session));
+        assert_eq!(history, vec!["first prompt", "second prompt"]);
     }
 
     #[test]

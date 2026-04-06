@@ -185,15 +185,16 @@ cargo run -p zetta-cli -- --provider deepseek tui
 
 Controls:
 
-- `Enter`: submit the current prompt
-- `Ctrl+J`: insert a newline in the composer
-- `Up` / `Down`: scroll the conversation pane
-- `Shift+Up` / `Shift+Down`: scroll the activity pane
+- `Tab` / `Shift+Tab`: switch focus between the conversation, activity, and prompt panes
+- `Enter`: submit the current prompt when the prompt pane is focused
+- `Shift+Enter`: insert a newline in the composer
+- `Alt+P` / `Alt+N`: recall previous or next submitted prompt
+- `Up` / `Down`: scroll whichever pane currently has focus
+- `?` or `F1`: open the in-app help overlay
 - `Esc` or `Ctrl+C`: exit the TUI
 - `Ctrl+N`: switch to a new session
 - `Ctrl+U`: clear the current input buffer
 - `Ctrl+L`: force a redraw
-- `F1`: print the control summary into the status pane
 
 The TUI requires an interactive terminal (TTY). It is not meant to run through a non-interactive pipe.
 If no provider is selected, the TUI runs with the local placeholder model and shows `provider: placeholder` in the header.
