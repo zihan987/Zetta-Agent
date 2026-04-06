@@ -1,10 +1,10 @@
 # Zetta Minimal Usage
 
-This is the shortest practical guide for using the current `v0.3.0` Zetta CLI and REPL.
+This is the shortest practical guide for using the current `v0.4.0` Zetta CLI, REPL, and TUI.
 
 ## What It Is
 
-Zetta is currently a CLI-first agent runtime with an interactive REPL.
+Zetta is currently a terminal-first agent runtime with a CLI, an interactive REPL, and a full-screen TUI.
 
 It can:
 
@@ -15,8 +15,7 @@ It can:
 - persist sessions
 - enforce permission and hook policy
 - show live turn progress on stderr with `--ui-mode`
-
-It is not yet a full-screen terminal UI.
+- run in a full-screen terminal UI with `zetta tui`
 
 ## Build
 
@@ -40,6 +39,12 @@ Start an interactive REPL:
 
 ```bash
 cargo run -p zetta-cli -- repl
+```
+
+Start the full-screen TUI:
+
+```bash
+cargo run -p zetta-cli -- tui
 ```
 
 Local REPL commands:

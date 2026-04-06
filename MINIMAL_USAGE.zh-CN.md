@@ -1,10 +1,10 @@
 # Zetta 使用指南
 
-这是当前 `v0.3.0` 版本 Zetta CLI 与 REPL 的中文使用指南。
+这是当前 `v0.4.0` 版本 Zetta CLI、REPL 和 TUI 的中文使用指南。
 
 ## 它现在是什么
 
-Zetta 目前是一个以 CLI 和 REPL 为主的 agent runtime。
+Zetta 目前是一个以 CLI、REPL 和全屏 TUI 为主的 agent runtime。
 
 它可以：
 
@@ -15,8 +15,7 @@ Zetta 目前是一个以 CLI 和 REPL 为主的 agent runtime。
 - 持久化 session
 - 应用 permission 和 hook 策略
 - 通过 `--ui-mode` 在 stderr 上显示实时 turn 进度
-
-它目前还不是一个全屏 terminal UI。
+- 通过 `zetta tui` 进入全屏 terminal UI
 
 ## 构建
 
@@ -40,6 +39,12 @@ cargo run -p zetta-cli -- --ui-mode pretty run --prompt "检查当前工作区"
 
 ```bash
 cargo run -p zetta-cli -- repl
+```
+
+启动全屏 TUI：
+
+```bash
+cargo run -p zetta-cli -- tui
 ```
 
 REPL 内置本地命令：

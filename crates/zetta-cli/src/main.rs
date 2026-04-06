@@ -6,15 +6,23 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Error, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::cursor::{MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::Print;
+use crossterm::terminal::{
+    self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
+use crossterm::{execute, queue};
 use hook_config::{merge_hook_configs, HookConfigStore, HookScope, PersistentHookConfig};
 use permission_config::{
     merge_permission_configs, PermissionConfigStore, PermissionScope, PersistentPermissionConfig,
@@ -23,11 +31,12 @@ use provider_config::{PersistentProviderProfile, ProviderConfigStore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zetta_core::engine::{AgentEngine, EngineEventSink};
 use zetta_core::hook::{DenyToolHook, HookBus, JsonlHook, SessionAnnotatingHook};
 use zetta_core::model::{
-    tool_call_from_user_input, ModelClient, ModelStreamSink, OpenAiCompatibleConfig,
-    OpenAiCompatibleModelClient, RuleBasedModelClient,
+    summarize_tool_result, tool_call_from_user_input, ModelClient, ModelStreamSink,
+    OpenAiCompatibleConfig, OpenAiCompatibleModelClient, RuleBasedModelClient,
 };
 use zetta_core::session::{FileSessionStore, SessionStore};
 use zetta_core::tool::{
@@ -186,6 +195,11 @@ enum Commands {
     },
     #[command(about = "Start the interactive REPL")]
     Repl {
+        #[arg(long)]
+        session_id: Option<SessionId>,
+    },
+    #[command(about = "Start the full-screen terminal UI")]
+    Tui {
         #[arg(long)]
         session_id: Option<SessionId>,
     },
@@ -512,6 +526,21 @@ async fn run_cli() -> Result<()> {
             )
             .await?;
         }
+        Commands::Tui { session_id } => {
+            run_tui(
+                &cli,
+                store.clone(),
+                &config_store,
+                &hook_config_store,
+                &provider_config_store,
+                &cli_overrides,
+                &cli_hook_overrides,
+                &cwd,
+                &workspace_root,
+                session_id,
+            )
+            .await?;
+        }
         Commands::Session { command } => match command {
             SessionCommands::Show { session_id } => {
                 let Some(session) = store.load(&session_id).await? else {
@@ -582,7 +611,7 @@ fn print_cli_error(error: &Error) {
     }
 }
 
-async fn run_agent_turn(
+fn build_agent_engine(
     cli: &Cli,
     store: Arc<FileSessionStore>,
     config_store: &PermissionConfigStore,
@@ -594,9 +623,7 @@ async fn run_agent_turn(
     workspace_root: &std::path::Path,
     session_id: Option<SessionId>,
     active_provider: Option<&str>,
-    ui_mode: CliUiMode,
-    prompt: &str,
-) -> Result<zetta_core::engine::RunTurnOutput> {
+) -> Result<AgentEngine> {
     let hook_bus = build_hook_bus(
         cli.hook_log.as_ref(),
         hook_config_store,
@@ -614,7 +641,43 @@ async fn run_agent_turn(
         registry.visible_definitions(&tool_context),
         provider_profile.as_ref(),
     )?;
-    let engine = AgentEngine::new(model, store, registry, tool_context, hook_bus);
+    Ok(AgentEngine::new(
+        model,
+        store,
+        registry,
+        tool_context,
+        hook_bus,
+    ))
+}
+
+async fn run_agent_turn(
+    cli: &Cli,
+    store: Arc<FileSessionStore>,
+    config_store: &PermissionConfigStore,
+    hook_config_store: &HookConfigStore,
+    provider_config_store: &ProviderConfigStore,
+    cli_overrides: &PersistentPermissionConfig,
+    cli_hook_overrides: &PersistentHookConfig,
+    cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
+    session_id: Option<SessionId>,
+    active_provider: Option<&str>,
+    ui_mode: CliUiMode,
+    prompt: &str,
+) -> Result<zetta_core::engine::RunTurnOutput> {
+    let engine = build_agent_engine(
+        cli,
+        store,
+        config_store,
+        hook_config_store,
+        provider_config_store,
+        cli_overrides,
+        cli_hook_overrides,
+        cwd,
+        workspace_root,
+        session_id,
+        active_provider,
+    )?;
     let request = TurnRequest {
         session_id,
         prompt: prompt.to_string(),
@@ -1080,6 +1143,235 @@ async fn run_repl(
     }
 
     Ok(())
+}
+
+async fn run_tui(
+    cli: &Cli,
+    store: Arc<FileSessionStore>,
+    config_store: &PermissionConfigStore,
+    hook_config_store: &HookConfigStore,
+    provider_config_store: &ProviderConfigStore,
+    cli_overrides: &PersistentPermissionConfig,
+    cli_hook_overrides: &PersistentHookConfig,
+    cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
+    session_id: Option<SessionId>,
+) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("`zetta tui` requires an interactive terminal (TTY)");
+    }
+
+    let session_id = session_id.unwrap_or_default();
+    let session = store.load(&session_id).await?;
+    let stdout = io::stdout();
+
+    enable_raw_mode()?;
+    execute!(
+        stdout.lock(),
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        Show
+    )?;
+    let _guard = TuiTerminalGuard;
+
+    let runtime = Arc::new(Mutex::new(TuiRuntime::new(TuiState {
+        session_id,
+        active_provider: cli.provider.clone(),
+        permission_mode: cli.permission_mode,
+        input: String::new(),
+        pending_assistant: String::new(),
+        event_lines: vec![
+            "F1 help | Enter submit | Esc exit | Ctrl+N new session | Ctrl+L redraw | Ctrl+U clear input"
+                .to_string(),
+        ],
+        last_error: None,
+        busy: false,
+        session,
+    })));
+
+    runtime.lock().expect("tui runtime").render()?;
+
+    loop {
+        if event::poll(Duration::from_millis(50))? {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+
+            match handle_tui_key(runtime.clone(), key)? {
+                TuiAction::None => {}
+                TuiAction::Exit => break,
+                TuiAction::Submit => {
+                    run_tui_turn(
+                        cli,
+                        store.clone(),
+                        config_store,
+                        hook_config_store,
+                        provider_config_store,
+                        cli_overrides,
+                        cli_hook_overrides,
+                        cwd,
+                        workspace_root,
+                        runtime.clone(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_tui_turn(
+    cli: &Cli,
+    store: Arc<FileSessionStore>,
+    config_store: &PermissionConfigStore,
+    hook_config_store: &HookConfigStore,
+    provider_config_store: &ProviderConfigStore,
+    cli_overrides: &PersistentPermissionConfig,
+    cli_hook_overrides: &PersistentHookConfig,
+    cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
+    runtime: Arc<Mutex<TuiRuntime>>,
+) -> Result<()> {
+    let (session_id, active_provider, permission_mode, prompt) = {
+        let mut runtime = runtime.lock().expect("tui runtime");
+        let prompt = runtime.state.input.trim().to_string();
+        runtime.state.input.clear();
+        runtime.state.pending_assistant.clear();
+        runtime.state.last_error = None;
+        runtime.state.busy = true;
+        runtime.push_event_line(format!("[submit] {}", summarize_history_content(&prompt)));
+        runtime.render()?;
+        (
+            runtime.state.session_id,
+            runtime.state.active_provider.clone(),
+            runtime.state.permission_mode,
+            prompt,
+        )
+    };
+
+    let effective_overrides = effective_permission_overrides(cli_overrides, permission_mode);
+    let engine = build_agent_engine(
+        cli,
+        store,
+        config_store,
+        hook_config_store,
+        provider_config_store,
+        &effective_overrides,
+        cli_hook_overrides,
+        cwd,
+        workspace_root,
+        Some(session_id),
+        active_provider.as_deref(),
+    )?;
+
+    let request = TurnRequest {
+        session_id: Some(session_id),
+        prompt,
+    };
+    let mut model_sink = TuiModelStreamSink {
+        runtime: runtime.clone(),
+    };
+    let mut event_sink = TuiEventSink {
+        runtime: runtime.clone(),
+    };
+
+    let output = engine
+        .run_turn_with_sinks(request, Some(&mut model_sink), Some(&mut event_sink))
+        .await;
+
+    let mut runtime = runtime.lock().expect("tui runtime");
+    runtime.state.busy = false;
+    runtime.state.pending_assistant.clear();
+
+    match output {
+        Ok(output) => {
+            runtime.state.session_id = output.session.session_id;
+            runtime.state.session = Some(output.session);
+            for failure in output.hook_failures {
+                runtime.push_event_line(format!(
+                    "[hook] {} failed: {}",
+                    failure.handler_name, failure.error
+                ));
+            }
+        }
+        Err(error) => {
+            let message = render_cli_error_lines(&error).join(" | ");
+            runtime.state.last_error = Some(message.clone());
+            runtime.push_event_line(format!("[error] {message}"));
+        }
+    }
+
+    runtime.render()?;
+    Ok(())
+}
+
+enum TuiAction {
+    None,
+    Submit,
+    Exit,
+}
+
+fn handle_tui_key(runtime: Arc<Mutex<TuiRuntime>>, key: KeyEvent) -> Result<TuiAction> {
+    let mut runtime = runtime.lock().expect("tui runtime");
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => return Ok(TuiAction::Exit),
+            KeyCode::Char('l') => {
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            KeyCode::Char('u') => {
+                runtime.state.input.clear();
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            KeyCode::Char('n') => {
+                runtime.state.session_id = SessionId::new();
+                runtime.state.session = None;
+                runtime.state.pending_assistant.clear();
+                let session_id = runtime.state.session_id;
+                runtime.push_event_line(format!("[session] switched to {session_id}"));
+                runtime.render()?;
+                return Ok(TuiAction::None);
+            }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => return Ok(TuiAction::Exit),
+        KeyCode::F(1) => {
+            runtime.push_event_line(
+                "[help] Enter submit | Esc exit | Ctrl+N new session | Ctrl+U clear input | Ctrl+L redraw"
+                    .to_string(),
+            );
+        }
+        KeyCode::Backspace => {
+            runtime.state.input.pop();
+        }
+        KeyCode::Enter => {
+            let should_submit = !runtime.state.busy && !runtime.state.input.trim().is_empty();
+            runtime.render()?;
+            return Ok(if should_submit {
+                TuiAction::Submit
+            } else {
+                TuiAction::None
+            });
+        }
+        KeyCode::Tab => runtime.state.input.push_str("    "),
+        KeyCode::Char(character) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                runtime.state.input.push(character);
+            }
+        }
+        _ => {}
+    }
+
+    runtime.render()?;
+    Ok(TuiAction::None)
 }
 
 fn render_cli_error_lines(error: &Error) -> Vec<String> {
@@ -1698,6 +1990,404 @@ impl EngineEventSink for StderrTurnPresenter {
                 eprintln!("{}", serde_json::to_string(event)?);
                 Ok(())
             }
+        }
+    }
+}
+
+struct TuiTerminalGuard;
+
+impl Drop for TuiTerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    }
+}
+
+struct TuiState {
+    session_id: SessionId,
+    active_provider: Option<String>,
+    permission_mode: Option<CliPermissionMode>,
+    input: String,
+    pending_assistant: String,
+    event_lines: Vec<String>,
+    last_error: Option<String>,
+    busy: bool,
+    session: Option<zetta_protocol::SessionSnapshot>,
+}
+
+struct TuiRuntime {
+    state: TuiState,
+}
+
+impl TuiRuntime {
+    fn new(state: TuiState) -> Self {
+        Self { state }
+    }
+
+    fn push_event_line(&mut self, line: String) {
+        self.state.event_lines.push(line);
+        const MAX_EVENT_LINES: usize = 200;
+        if self.state.event_lines.len() > MAX_EVENT_LINES {
+            let trim = self.state.event_lines.len() - MAX_EVENT_LINES;
+            self.state.event_lines.drain(0..trim);
+        }
+    }
+
+    fn render(&mut self) -> Result<()> {
+        let mut stdout = io::stdout();
+        let (cols, rows) = terminal::size()?;
+        queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+
+        let input_height = 4u16;
+        let status_width = if cols >= 80 {
+            36.min(cols.saturating_sub(24))
+        } else if cols >= 64 {
+            24.min(cols.saturating_sub(24))
+        } else {
+            0
+        };
+        let transcript_width = if status_width == 0 {
+            cols
+        } else {
+            cols.saturating_sub(status_width)
+        };
+        let top_height = rows.saturating_sub(input_height);
+
+        let transcript_lines = tui_transcript_lines(&self.state);
+        let status_lines = tui_status_lines(&self.state);
+        let input_lines = tui_input_lines(&self.state);
+
+        draw_box(
+            &mut stdout,
+            0,
+            0,
+            transcript_width,
+            top_height,
+            "Transcript",
+            &transcript_lines,
+        )?;
+        draw_box(
+            &mut stdout,
+            transcript_width,
+            0,
+            status_width,
+            top_height,
+            "Status",
+            &status_lines,
+        )?;
+        draw_box(
+            &mut stdout,
+            0,
+            top_height,
+            cols,
+            input_height,
+            if self.state.busy {
+                "Input (running...)"
+            } else {
+                "Input"
+            },
+            &input_lines,
+        )?;
+
+        let cursor_y = top_height
+            .saturating_add(1)
+            .saturating_add(input_lines.len().saturating_sub(1) as u16);
+        let cursor_x = 1u16.saturating_add(
+            input_lines
+                .last()
+                .map(|line| display_width(line) as u16)
+                .unwrap_or(0),
+        );
+        queue!(
+            stdout,
+            MoveTo(
+                cursor_x.min(cols.saturating_sub(1)),
+                cursor_y.min(rows.saturating_sub(1))
+            )
+        )?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+struct TuiEventSink {
+    runtime: Arc<Mutex<TuiRuntime>>,
+}
+
+impl EngineEventSink for TuiEventSink {
+    fn on_event(&mut self, event: &zetta_protocol::EngineEvent) -> Result<()> {
+        let mut runtime = self.runtime.lock().expect("tui runtime");
+        runtime.push_event_line(render_engine_event_line(event));
+        if matches!(
+            event,
+            zetta_protocol::EngineEvent::AssistantMessagePersisted { .. }
+        ) {
+            runtime.state.pending_assistant.clear();
+        }
+        runtime.render()?;
+        Ok(())
+    }
+}
+
+struct TuiModelStreamSink {
+    runtime: Arc<Mutex<TuiRuntime>>,
+}
+
+impl ModelStreamSink for TuiModelStreamSink {
+    fn on_text_delta(&mut self, delta: &str) -> Result<()> {
+        let mut runtime = self.runtime.lock().expect("tui runtime");
+        runtime.state.pending_assistant.push_str(delta);
+        runtime.render()?;
+        Ok(())
+    }
+
+    fn on_message_end(&mut self) -> Result<()> {
+        let mut runtime = self.runtime.lock().expect("tui runtime");
+        runtime.render()?;
+        Ok(())
+    }
+}
+
+fn tui_transcript_lines(state: &TuiState) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if let Some(session) = &state.session {
+        for message in &session.messages {
+            let role = match message.role {
+                zetta_protocol::MessageRole::System => "system",
+                zetta_protocol::MessageRole::User => "user",
+                zetta_protocol::MessageRole::Assistant => "assistant",
+                zetta_protocol::MessageRole::Tool => "tool",
+            };
+            let content = if matches!(message.role, zetta_protocol::MessageRole::Tool) {
+                summarize_tool_result(&message.content)
+            } else {
+                message.content.clone()
+            };
+            lines.push(format!("[{role}]"));
+            lines.extend(content.lines().map(ToString::to_string));
+            lines.push(String::new());
+        }
+    } else {
+        lines.push("<empty session>".to_string());
+    }
+
+    if !state.pending_assistant.is_empty() {
+        lines.push("[assistant/stream]".to_string());
+        lines.extend(state.pending_assistant.lines().map(ToString::to_string));
+    }
+
+    lines
+}
+
+fn tui_status_lines(state: &TuiState) -> Vec<String> {
+    let mut lines = vec![
+        format!("session: {}", state.session_id),
+        format!(
+            "provider: {}",
+            state.active_provider.as_deref().unwrap_or("<none>")
+        ),
+        format!(
+            "mode: {}",
+            state
+                .permission_mode
+                .unwrap_or(CliPermissionMode::WorkspaceWrite)
+                .as_str()
+        ),
+        format!("state: {}", if state.busy { "running" } else { "idle" }),
+    ];
+
+    if let Some(session) = &state.session {
+        let overview = build_session_overview(session);
+        lines.push(format!("turns: {}", overview.user_turns));
+        lines.push(format!("messages: {}", session.messages.len()));
+        lines.push(format!(
+            "tools: ok={} deny={} fail={}",
+            overview.completed_tools, overview.denied_tools, overview.failed_tools
+        ));
+    }
+
+    if let Some(error) = &state.last_error {
+        lines.push(String::new());
+        lines.push("error:".to_string());
+        lines.push(error.clone());
+    }
+
+    lines.push(String::new());
+    lines.push("recent:".to_string());
+    lines.extend(
+        state
+            .event_lines
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    lines
+}
+
+fn tui_input_lines(state: &TuiState) -> Vec<String> {
+    if state.input.is_empty() {
+        vec!["Type a prompt and press Enter. Esc exits.".to_string()]
+    } else {
+        state.input.lines().map(ToString::to_string).collect()
+    }
+}
+
+fn draw_box(
+    stdout: &mut io::Stdout,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    title: &str,
+    lines: &[String],
+) -> Result<()> {
+    if width < 4 || height < 3 {
+        return Ok(());
+    }
+
+    let inner_width = width.saturating_sub(2) as usize;
+    let horizontal = "─".repeat(inner_width);
+    queue!(stdout, MoveTo(x, y), Print(format!("┌{horizontal}┐")))?;
+
+    let title_text = format!(" {title} ");
+    let title_len = title_text.chars().count().min(inner_width);
+    queue!(
+        stdout,
+        MoveTo(x + 1, y),
+        Print(title_text.chars().take(title_len).collect::<String>())
+    )?;
+
+    let wrapped = wrap_lines(lines, inner_width);
+    let visible_capacity = height.saturating_sub(2) as usize;
+    let visible_start = wrapped.len().saturating_sub(visible_capacity);
+    let visible = &wrapped[visible_start..];
+
+    for row in 0..height.saturating_sub(2) {
+        let content = visible
+            .get(row as usize)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let padded = pad_to_width(content, inner_width);
+        queue!(
+            stdout,
+            MoveTo(x, y + 1 + row),
+            Print("│"),
+            Print(padded),
+            Print("│")
+        )?;
+    }
+
+    queue!(
+        stdout,
+        MoveTo(x, y + height - 1),
+        Print(format!("└{}┘", "─".repeat(inner_width)))
+    )?;
+    Ok(())
+}
+
+fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+
+    for line in lines {
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width + ch_width > width && !current.is_empty() {
+                wrapped.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+            if current_width >= width && !current.is_empty() {
+                wrapped.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+        }
+        if current.is_empty() {
+            continue;
+        }
+        wrapped.push(current);
+    }
+
+    wrapped
+}
+
+fn pad_to_width(input: &str, width: usize) -> String {
+    let mut padded = String::new();
+    let mut used = 0usize;
+
+    for ch in input.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            break;
+        }
+        padded.push(ch);
+        used += ch_width;
+    }
+
+    if used < width {
+        padded.push_str(&" ".repeat(width - used));
+    }
+    padded
+}
+
+fn display_width(input: &str) -> usize {
+    UnicodeWidthStr::width(input)
+}
+
+fn render_engine_event_line(event: &zetta_protocol::EngineEvent) -> String {
+    match event {
+        zetta_protocol::EngineEvent::SessionLoaded { session_id, is_new } => {
+            format!(
+                "[turn] session={} state={}",
+                session_id,
+                if *is_new { "new" } else { "resume" }
+            )
+        }
+        zetta_protocol::EngineEvent::UserMessagePersisted { .. } => {
+            "[turn] user message persisted".to_string()
+        }
+        zetta_protocol::EngineEvent::ToolCallRequested { call } => {
+            format!(
+                "[tool] request {} {}",
+                call.name,
+                summarize_json_inline(&call.input, 56)
+            )
+        }
+        zetta_protocol::EngineEvent::ToolCallDenied { call, reason } => {
+            format!("[tool] denied {}: {reason}", call.name)
+        }
+        zetta_protocol::EngineEvent::ToolCallFailed { call, error } => {
+            format!("[tool] failed {}: {error}", call.name)
+        }
+        zetta_protocol::EngineEvent::ToolCallCompleted { result } => {
+            format!(
+                "[tool] done {} {}",
+                result.name,
+                summarize_json_inline(&result.output, 56)
+            )
+        }
+        zetta_protocol::EngineEvent::AssistantMessagePersisted { message } => {
+            format!(
+                "[assistant] {}",
+                summarize_history_content(&message.content)
+            )
+        }
+        zetta_protocol::EngineEvent::TurnFinished { session_id } => {
+            format!("[summary] session={session_id} finished")
         }
     }
 }
@@ -2554,10 +3244,11 @@ mod tests {
     use crate::{CliPermissionMode, CliUiMode};
 
     use super::{
-        build_session_overview, default_openai_system_prompt, latest_assistant_message,
-        parse_repl_command, render_cli_error_lines, render_repl_prompt, resolve_openai_options,
-        search_session_messages, summarize_history_content, trim_session_to_last_user_turns,
-        user_turn_from_end, ReplCommand, ResolvedOpenAiCompatibleOptions,
+        build_session_overview, default_openai_system_prompt, display_width,
+        latest_assistant_message, pad_to_width, parse_repl_command, render_cli_error_lines,
+        render_repl_prompt, resolve_openai_options, search_session_messages,
+        summarize_history_content, trim_session_to_last_user_turns, user_turn_from_end, wrap_lines,
+        ReplCommand, ResolvedOpenAiCompatibleOptions,
     };
 
     #[test]
@@ -2630,6 +3321,16 @@ mod tests {
             lines,
             vec!["Path policy error: write path `/tmp/.git/config` is protected: repository metadata"]
         );
+    }
+
+    #[test]
+    fn tui_line_helpers_measure_wide_characters_by_display_width() {
+        assert_eq!(display_width("仓库"), 4);
+        assert_eq!(
+            wrap_lines(&[String::from("仓库结构")], 4),
+            vec!["仓库", "结构"]
+        );
+        assert_eq!(pad_to_width("仓库", 6), "仓库  ");
     }
 
     #[test]

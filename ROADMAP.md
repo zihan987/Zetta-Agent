@@ -5,9 +5,9 @@
 - `P0`: runtime core, permissions, sessions, hooks, model driver
 - `P1`: interactive CLI and REPL ergonomics
 - `P2`: provider and native tool-calling depth
-- `P3`: terminal UX, live turn presentation, and session overview helpers
+- `P3`: full terminal UX, live turn presentation, session overview helpers, and a full-screen TUI
 
-These are now complete enough for a `v0.3.0` release.
+These are now complete enough for a `v0.4.0` release.
 
 ## Next
 
@@ -18,7 +18,7 @@ These are now complete enough for a `v0.3.0` release.
 - editor / IDE integration
 - richer provider-specific adapters beyond OpenAI-compatible transport
 
-## Non-Goals For v0.3.x
+## Non-Goals For v0.4.x
 
 - React/Ink parity
 - full Claude Code feature parity

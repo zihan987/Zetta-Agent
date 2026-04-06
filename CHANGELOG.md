@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.0
+
+P3 full terminal UI release.
+
+Included in this release:
+
+- `zetta tui`, a full-screen terminal UI built on top of the existing runtime
+- transcript, status, and input panes in the TUI
+- live tool and assistant progress in the TUI via the same engine event flow used by the CLI presenter
+- graceful TTY checks for the TUI command
+- stronger tool-routing guidance for structure/search/edit tasks
+- bounded `glob` result sets with noisy runtime/build directories skipped during recursive walks
+
+This release turns the earlier terminal UX layer into a real full-screen interface while keeping the existing CLI and REPL workflows available.
+
 ## v0.3.0
 
 P3 terminal UX release.

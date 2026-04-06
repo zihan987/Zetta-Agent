@@ -11,12 +11,12 @@ Docs:
 
 ## Release Status
 
-Current release target: `v0.3.0`
+Current release target: `v0.4.0`
 
 - `P0` complete: runtime core, permissions, hooks, sessions, OpenAI-compatible model driver
 - `P1` complete: interactive REPL and CLI ergonomics
 - `P2` complete: native tool-calling for OpenAI-compatible providers with text fallback preserved
-- `P3` complete: terminal UX, live turn presentation, and session overview helpers
+- `P3` complete: full terminal UX, live turn presentation, session overview helpers, and a full-screen TUI
 - Next focus: `P4` integrations and external surfaces
 
 ## Current Scope
@@ -40,6 +40,7 @@ The current workspace ships a usable CLI agent runtime:
 - invalid `/tool ...` attempts are fed back into the transcript so the model can correct and retry within the same turn
 - a live stderr turn presenter with `--ui-mode off|pretty|json`
 - session overview helpers in both `session overview` and REPL
+- a full-screen terminal UI via `zetta tui`
 
 This intentionally does **not** include:
 
@@ -103,6 +104,7 @@ Local REPL commands:
 cd Zetta-Agent
 cargo run -p zetta-cli -- run --prompt "hello"
 cargo run -p zetta-cli -- repl
+cargo run -p zetta-cli -- tui
 cargo run -p zetta-cli -- run --prompt "/tool echo staged rewrite"
 cargo run -p zetta-cli -- --ui-mode pretty run --prompt "inspect the workspace"
 cargo run -p zetta-cli -- provider set deepseek --api-base https://api.deepseek.com --api-key-env DEEPSEEK_API_KEY --model-name deepseek-chat
@@ -172,6 +174,25 @@ Runtime config is merged in this order:
 - `--ui-mode json` streams raw `EngineEvent` JSON to stderr
 - `run --json` still writes the final event list to stdout; `--ui-mode` only affects the live stderr presenter
 
+## Full-Screen TUI
+
+Start it from a real terminal:
+
+```bash
+cargo run -p zetta-cli -- tui
+```
+
+Controls:
+
+- `Enter`: submit the current prompt
+- `Esc` or `Ctrl+C`: exit the TUI
+- `Ctrl+N`: switch to a new session
+- `Ctrl+U`: clear the current input buffer
+- `Ctrl+L`: force a redraw
+- `F1`: print the control summary into the status pane
+
+The TUI requires an interactive terminal (TTY). It is not meant to run through a non-interactive pipe.
+
 ### OpenAI-Compatible Providers
 
 Any provider that accepts an OpenAI-style `POST {base_url}/chat/completions` request can be used with the current runtime.
@@ -232,5 +253,5 @@ Profiles are stored under `--config-dir/providers.json`. CLI flags still overrid
 1. `P0`: runtime core, tools, permissions, hooks, sessions
 2. `P1`: interactive CLI and REPL ergonomics
 3. `P2`: model/provider depth and native tool-calling
-4. `P3`: terminal UX, live turn presentation, and session overviews
+4. `P3`: full terminal UX, live turn presentation, session overviews, and a full-screen TUI
 5. `P4`: next stage, focused on integrations and external surfaces
