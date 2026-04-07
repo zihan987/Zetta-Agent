@@ -51,15 +51,22 @@ cargo run -p zetta-cli -- --provider deepseek tui
 TUI 快捷键：
 
 - `Tab` / `Shift+Tab` 在不同 pane 间切换焦点
-- `Enter` 在 prompt pane 聚焦时发送当前输入
+- `Enter` 在 prompt pane 聚焦时发送当前输入；如果当前 turn 正在运行，则把输入加入后续队列
 - `Shift+Enter` 插入换行
+- 可以直接粘贴多行文本到 prompt pane
+- `Left` / `Right` / `Home` / `End` 在 prompt 输入区内移动和编辑
 - `Alt+P` / `Alt+N` 回看之前提交过的 prompt
 - `Up` / `Down` 滚动当前聚焦的 pane
+- `j` / `k` / `g` / `G` 提供更像 vim 的 pane 滚动方式
 - `?` 或 `F1` 打开内置帮助浮层
+- `/help`、`/new`、`/session`、`/tools`、`/provider`、`/mode`、`/overview` 可以直接在 composer 里执行本地 slash 命令
 - `Ctrl+N` 新建 session
 - `Ctrl+U` 清空输入框
 - `Ctrl+L` 强制重绘
 - `Esc` 或 `Ctrl+C` 退出
+
+turn 运行中，prompt 输入区仍然可编辑，并会在输入框上方显示一条实时状态行；此时按 `Enter` 会把 follow-up 排队。
+如果你把会话或活动 pane 滚离底部，pane 标题会变成 `paused`，并显示后续新增了多少条内容。
 
 REPL 内置本地命令：
 

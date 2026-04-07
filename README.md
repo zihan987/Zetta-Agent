@@ -186,11 +186,15 @@ cargo run -p zetta-cli -- --provider deepseek tui
 Controls:
 
 - `Tab` / `Shift+Tab`: switch focus between the conversation, activity, and prompt panes
-- `Enter`: submit the current prompt when the prompt pane is focused
+- `Enter`: submit the current prompt, or queue a follow-up while Zetta is already running
 - `Shift+Enter`: insert a newline in the composer
+- paste text directly into the prompt pane; multi-line paste is supported
+- `Left` / `Right` / `Home` / `End`: edit inside the prompt composer
 - `Alt+P` / `Alt+N`: recall previous or next submitted prompt
 - `Up` / `Down`: scroll whichever pane currently has focus
+- `j` / `k` / `g` / `G`: vim-style scroll shortcuts for the focused conversation or activity pane
 - `?` or `F1`: open the in-app help overlay
+- `/help`, `/new`, `/session`, `/tools`, `/provider`, `/mode`, `/overview`: run local slash commands directly from the prompt composer
 - `Esc` or `Ctrl+C`: exit the TUI
 - `Ctrl+N`: switch to a new session
 - `Ctrl+U`: clear the current input buffer
@@ -198,6 +202,8 @@ Controls:
 
 The TUI requires an interactive terminal (TTY). It is not meant to run through a non-interactive pipe.
 If no provider is selected, the TUI runs with the local placeholder model and shows `provider: placeholder` in the header.
+While a turn is running, the composer stays editable and shows a live status row above the prompt area. Press `Enter` to queue a follow-up turn.
+If you scroll away from the bottom of the conversation or activity panes, the title switches to `paused` and shows how many new items arrived.
 
 ### OpenAI-Compatible Providers
 

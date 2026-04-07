@@ -51,15 +51,22 @@ cargo run -p zetta-cli -- --provider deepseek tui
 TUI controls:
 
 - `Tab` / `Shift+Tab` switches focus between panes
-- `Enter` sends the prompt when the prompt pane is focused
+- `Enter` sends the prompt, or queues a follow-up while Zetta is already running
 - `Shift+Enter` inserts a newline
+- paste text directly into the prompt pane; multi-line paste is supported
+- `Left` / `Right` / `Home` / `End` edit inside the prompt composer
 - `Alt+P` / `Alt+N` recalls earlier prompts
 - `Up` / `Down` scrolls the currently focused pane
+- `j` / `k` / `g` / `G` provide vim-style scrolling in the focused conversation or activity pane
 - `?` or `F1` opens the in-app help overlay
+- `/help`, `/new`, `/session`, `/tools`, `/provider`, `/mode`, `/overview` run local slash commands directly from the composer
 - `Ctrl+N` starts a new session
 - `Ctrl+U` clears the composer
 - `Ctrl+L` redraws the screen
 - `Esc` or `Ctrl+C` exits
+
+While a turn is running, the prompt composer stays editable and shows a live status row. Press `Enter` to queue a follow-up.
+If you scroll away from the bottom, the pane title switches to `paused` and shows how many new items arrived.
 
 Local REPL commands:
 
