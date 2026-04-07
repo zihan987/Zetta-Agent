@@ -75,15 +75,16 @@ pub(crate) use runtime::{build_agent_engine, print_cli_error, run_agent_turn};
 use session_view::{build_session_overview, print_session_overview, session_overview_text};
 #[cfg(test)]
 use tui::{
-    clamp_cursor_boundary, display_width, line_end_boundary, line_start_boundary,
-    next_char_boundary, pane_title, previous_char_boundary, render_markdown_styled_lines,
-    split_text_lines, tui_input_history_from_session, wrap_plain_lines,
+    clamp_cursor_boundary, display_width, format_elapsed, line_end_boundary,
+    line_start_boundary, next_char_boundary, pane_title, parse_tui_slash_command,
+    previous_char_boundary, render_markdown_styled_lines, search_session_messages,
+    split_text_lines, summarize_history_content, tui_input_history_from_session,
+    wrap_plain_lines,
 };
 use tui::{
-    format_elapsed, latest_assistant_message, parse_repl_command, parse_tui_slash_command,
-    print_provider_summary, print_runtime_summary, print_session_history,
-    print_session_search_results, print_session_summary, render_cli_error_lines,
-    render_repl_prompt, search_session_messages, summarize_history_content,
+    latest_assistant_message, parse_repl_command, print_provider_summary,
+    print_runtime_summary, print_session_history, print_session_search_results,
+    print_session_summary, render_cli_error_lines, render_repl_prompt,
     trim_session_to_last_user_turns, user_turn_from_end, StderrTurnPresenter,
 };
 
